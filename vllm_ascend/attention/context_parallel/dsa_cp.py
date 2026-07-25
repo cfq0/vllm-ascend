@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tp_group
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -26,6 +28,50 @@ from vllm_ascend.utils import (
     npu_stream_switch,
     olora_tp_enable,
 )
+
+# (token_start, length, slot_start): slots[token_start + i] == slot_start + i
+ContiguousSlotRun = tuple[int, int, int]
+
+
+def find_contiguous_slot_runs(
+    slot_mapping: torch.Tensor,
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> list[ContiguousSlotRun]:
+    """Scan linear slot ids on CPU and return contiguous runs.
+
+    Each run is ``(token_start, length, slot_start)`` such that for all
+    ``i in [0, length)``:
+        ``slot_mapping[token_start + i] == slot_start + i``.
+
+    Pad / invalid slots (``< 0`` or ``pad_slot_id``) break a run and are skipped.
+    Intended for builder-time planning so forward can ``copy_`` long runs into
+    a flattened KV cache and only scatter the residual gaps.
+    """
+    if slot_mapping is None or slot_mapping.numel() == 0:
+        return []
+    slots = slot_mapping.detach()
+    if slots.device.type != "cpu":
+        slots = slots.cpu()
+    arr = slots.reshape(-1).numpy()
+    if arr.dtype != np.int64:
+        arr = arr.astype(np.int64, copy=False)
+
+    runs: list[ContiguousSlotRun] = []
+    n = int(arr.size)
+    i = 0
+    while i < n:
+        s = int(arr[i])
+        if s < 0 or s == pad_slot_id:
+            i += 1
+            continue
+        token_start = i
+        slot_start = s
+        i += 1
+        while i < n and int(arr[i]) == slot_start + (i - token_start):
+            i += 1
+        runs.append((token_start, i - token_start, slot_start))
+    return runs
+
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
@@ -100,6 +146,9 @@ class AscendDSAReqMetadata:
     qli_metadata: torch.Tensor = None
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
+    # Builder-time contiguous linear-slot runs for SWA KV write planning:
+    # list of (token_start, length, slot_start). See find_contiguous_slot_runs.
+    contiguous_slot_runs: list[ContiguousSlotRun] | None = None
 
 
 @dataclass
@@ -318,6 +367,23 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
+        # Plan contiguous linear-slot runs once per step (shared across kv groups).
+        if self.common_ratio_to_sas_metadata.get("contiguous_slot_runs") is None:
+            n_slots = self.num_actual_tokens if self.num_actual_tokens is not None else num_input_tokens
+            contiguous_slot_runs = find_contiguous_slot_runs(slot_mapping[:n_slots])
+            self.common_ratio_to_sas_metadata["contiguous_slot_runs"] = contiguous_slot_runs
+            run_lens = [length for _, length, _ in contiguous_slot_runs]
+            covered = sum(run_lens)
+            print(
+                f"[DSA-CP slot_runs] n_slots={n_slots} num_reqs={num_reqs} "
+                f"num_runs={len(contiguous_slot_runs)} covered={covered} "
+                f"max_run={max(run_lens) if run_lens else 0} "
+                f"min_run={min(run_lens) if run_lens else 0} "
+                f"runs(token_start,len,slot_start)={contiguous_slot_runs[:16]}"
+                f"{'...' if len(contiguous_slot_runs) > 16 else ''}",
+                flush=True,
+            )
+
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
 
         req_metadata = self.build_req_metadata(
@@ -375,12 +441,25 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
+        n_slots = self.num_actual_tokens if self.num_actual_tokens is not None else num_input_tokens
+        contiguous_slot_runs = find_contiguous_slot_runs(slot_mapping[:n_slots])
+        run_lens = [length for _, length, _ in contiguous_slot_runs]
+        print(
+            f"[DSA-CP slot_runs][draft={draft_step}] n_slots={n_slots} num_reqs={num_reqs} "
+            f"num_runs={len(contiguous_slot_runs)} covered={sum(run_lens)} "
+            f"max_run={max(run_lens) if run_lens else 0} "
+            f"runs(token_start,len,slot_start)={contiguous_slot_runs[:16]}"
+            f"{'...' if len(contiguous_slot_runs) > 16 else ''}",
+            flush=True,
+        )
+
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         req_metadata = self.build_req_metadata_for_drafting(
             draft_step=draft_step,
             common_attn_metadata=common_attn_metadata,
             input_positions=input_positions,
             num_input_tokens=num_input_tokens,
+            contiguous_slot_runs=contiguous_slot_runs,
         )
 
         return self.metadata_cls(  # type: ignore
@@ -407,6 +486,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         input_positions: torch.Tensor,
         num_input_tokens: int,
+        contiguous_slot_runs: list[ContiguousSlotRun] | None = None,
     ) -> AscendDSAReqMetadata:
         """Build DSA-CP metadata for one draft step."""
         num_reqs = common_attn_metadata.num_reqs
@@ -505,6 +585,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             sas_metadata=sas_metadata,
             qli_metadata=None,
             cu_cmp_seqlen_list=None,
+            contiguous_slot_runs=contiguous_slot_runs,
         )
 
     def build_req_metadata(
@@ -638,6 +719,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             sas_metadata=sas_metadata,
             qli_metadata=qli_metadata,
             cu_cmp_seqlen_list=cu_cmp_seqlens,
+            contiguous_slot_runs=self.common_ratio_to_sas_metadata.get("contiguous_slot_runs"),
         )
 
     def _build_local_token_metadata(
