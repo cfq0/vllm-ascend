@@ -388,30 +388,34 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        # Plan SWA KV copy/scatter once per step. Length must match the
-        # slot_mapping later stored in req_metadata (actual tokens, and
-        # compressed count when compressor_ratio > 1). Trailing CG / TP pads
-        # beyond that length are excluded from the plan.
-        if self.common_ratio_to_sas_metadata.get("contiguous_slot_runs") is None:
-            n_slots = min(slot_mapping.shape[0], num_input_tokens)
-            if self.num_actual_tokens is not None:
-                n_slots = min(n_slots, self.num_actual_tokens)
-            if self.compressor_ratio > 1:
-                n_slots = min(
-                    n_slots,
-                    int(self._get_slot_mapping_size(input_positions_cpu, self.compressor_ratio)),
-                )
-            contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
-                slot_mapping[:n_slots],
-                device=self.slot_mapping.device,
+        # Plan from *this* kv-cache group's slot_mapping. Do NOT cache the plan
+        # in shared common_ratio_to_sas_metadata: that dict is reused across
+        # kv_cache_gid in model_runner, and each group has a different
+        # slot_mapping. Reusing another group's plan causes wrong copy_ writes.
+        n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
+        if self.num_actual_tokens is not None:
+            n_slots = min(n_slots, int(self.num_actual_tokens))
+        if self.compressor_ratio > 1:
+            n_slots = min(
+                n_slots,
+                int(self._get_slot_mapping_size(input_positions_cpu, self.compressor_ratio)),
             )
-            self.common_ratio_to_sas_metadata["contiguous_slot_runs"] = contiguous_slot_runs
-            self.common_ratio_to_sas_metadata["scatter_token_indices"] = scatter_token_indices
+        contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
+            slot_mapping[:n_slots],
+            device=self.slot_mapping.device,
+        )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
 
         req_metadata = self.build_req_metadata(
-            common_attn_metadata, input_positions, input_positions_cpu, num_input_tokens, num_reqs_actual, attn_state
+            common_attn_metadata,
+            input_positions,
+            input_positions_cpu,
+            num_input_tokens,
+            num_reqs_actual,
+            attn_state,
+            contiguous_slot_runs=contiguous_slot_runs,
+            scatter_token_indices=scatter_token_indices,
         )
 
         return self.metadata_cls(  # type: ignore
@@ -619,6 +623,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_input_tokens: int,
         num_reqs_actual: int | None,
         attn_state: AscendAttentionState,
+        contiguous_slot_runs: list[ContiguousSlotRun] | None = None,
+        scatter_token_indices: torch.Tensor | None = None,
     ) -> AscendDSAReqMetadata:
         """Build a single unified metadata for all requests (prefill + decode)."""
         num_reqs = common_attn_metadata.num_reqs
@@ -742,8 +748,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             sas_metadata=sas_metadata,
             qli_metadata=qli_metadata,
             cu_cmp_seqlen_list=cu_cmp_seqlens,
-            contiguous_slot_runs=self.common_ratio_to_sas_metadata.get("contiguous_slot_runs"),
-            scatter_token_indices=self.common_ratio_to_sas_metadata.get("scatter_token_indices"),
+            contiguous_slot_runs=contiguous_slot_runs,
+            scatter_token_indices=scatter_token_indices,
         )
 
     def _build_local_token_metadata(
@@ -1121,29 +1127,16 @@ class AscendDSACPImpl(DSAAttentionImpl):
     ) -> None:
         """Write SWA KV from builder plan: ``copy_`` runs, then scatter idxs.
 
-        Pad / length rules:
-        - Builder plans only valid linear slots (skips ``PAD_SLOT_ID`` / ``<0``).
-        - After TP ``all_gather`` + unpad, ``kv`` should match ``swa_slot``; if
-          gather pad remains (or metadata is shorter), clamp to
-          ``min(kv, swa_slot)`` so trailing pads are never written.
-        - ``swa_slot`` is 2D ``[block_id, offset]`` for scatter.
+        Contract: ``kv.shape[0] == swa_slot.shape[0]`` (full actual tokens).
+        Builder plans indices/runs against that same length.
         """
-        num_tokens = min(int(kv.shape[0]), int(swa_slot.shape[0]))
-        if num_tokens == 0:
-            return
-        kv = kv[:num_tokens]
-        swa_slot = swa_slot[:num_tokens]
-
         if contiguous_slot_runs:
+            num_tokens = kv.shape[0]
             kv_flat = kv.reshape(num_tokens, -1)
             cache_flat = swa_kv_cache.reshape(-1, kv_flat.shape[-1])
             for token_start, length, slot_start in contiguous_slot_runs:
                 token_start = int(token_start)
-                if token_start >= num_tokens:
-                    continue
-                length = min(int(length), num_tokens - token_start)
-                if length <= 0:
-                    continue
+                length = int(length)
                 slot_start = int(slot_start)
                 cache_flat[slot_start : slot_start + length].copy_(
                     kv_flat[token_start : token_start + length]
@@ -1151,13 +1144,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         if scatter_token_indices is None or scatter_token_indices.numel() == 0:
             return
-        idx = scatter_token_indices
-        if idx.device != kv.device:
-            idx = idx.to(device=kv.device, non_blocking=True)
-        # Drop any idx beyond clamped length (defensive vs TP gather pad).
-        idx = idx[idx < num_tokens].long()
-        if idx.numel() == 0:
-            return
+        idx = scatter_token_indices.long()
         torch.ops._C_ascend.npu_scatter_nd_update_v2(
             swa_kv_cache,
             swa_slot[idx].contiguous(),
