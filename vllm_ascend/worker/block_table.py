@@ -379,57 +379,17 @@ class MultiGroupBlockTable:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:
                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
-        # Debug: print every request's slot ids after allocation/mapping.
-        self._debug_print_per_req_slots(
-            num_reqs,
-            query_start_loc,
-            positions.shape[0],
-            positions_compressed_list,
-            req_indices_compressed_list,
-        )
+        # Debug: print each kv-cache group's block ids per request.
+        self._debug_print_per_req_block_ids(num_reqs)
 
-    def _debug_print_per_req_slots(
-        self,
-        num_reqs: int,
-        query_start_loc: torch.Tensor,
-        num_tokens: int,
-        positions_compressed_list: list[np.ndarray] | None = None,
-        req_indices_compressed_list: list[np.ndarray] | None = None,
-    ) -> None:
-        qsl = query_start_loc.detach()
-        if qsl.device.type != "cpu":
-            qsl = qsl.cpu()
-        qsl_list = qsl[: num_reqs + 1].tolist()
+    def _debug_print_per_req_block_ids(self, num_reqs: int) -> None:
         for gi, block_table in enumerate(self.block_tables):
-            if positions_compressed_list and req_indices_compressed_list:
-                n = int(len(positions_compressed_list[gi]))
-                slots = block_table.slot_mapping.gpu[:n].detach()
-                if slots.device.type != "cpu":
-                    slots = slots.cpu()
-                slots_list = slots.tolist()
-                req_ids = req_indices_compressed_list[gi]
-                for req_idx in range(num_reqs):
-                    req_slots = [int(slots_list[j]) for j, r in enumerate(req_ids) if int(r) == req_idx]
-                    print(
-                        f"[slot_alloc] group={gi} req={req_idx} compressed "
-                        f"n={len(req_slots)} slots={req_slots}",
-                        flush=True,
-                    )
-                continue
-
-            slots = block_table.slot_mapping.gpu[:num_tokens].detach()
-            if slots.device.type != "cpu":
-                slots = slots.cpu()
-            slots_list = [int(s) for s in slots.tolist()]
             for req_idx in range(num_reqs):
-                start = int(qsl_list[req_idx])
-                end = int(qsl_list[req_idx + 1])
-                req_slots = slots_list[start:end]
-                n_valid = sum(1 for s in req_slots if s >= 0 and s != PAD_SLOT_ID)
+                n_blocks = int(block_table.num_blocks_per_row[req_idx])
+                block_ids = block_table.block_table.np[req_idx, :n_blocks].tolist()
                 print(
-                    f"[slot_alloc] group={gi} req={req_idx} "
-                    f"token_range=[{start},{end}) n={end - start} "
-                    f"valid={n_valid} slots={req_slots}",
+                    f"[block_alloc] group={gi} req={req_idx} "
+                    f"n_blocks={n_blocks} block_ids={block_ids}",
                     flush=True,
                 )
 
