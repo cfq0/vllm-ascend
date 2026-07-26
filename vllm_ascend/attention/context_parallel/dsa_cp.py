@@ -370,15 +370,30 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # Plan contiguous linear-slot runs once per step (shared across kv groups).
         if self.common_ratio_to_sas_metadata.get("contiguous_slot_runs") is None:
             n_slots = self.num_actual_tokens if self.num_actual_tokens is not None else num_input_tokens
-            contiguous_slot_runs = find_contiguous_slot_runs(slot_mapping[:n_slots])
+            slots_1d = slot_mapping[:n_slots]
+            contiguous_slot_runs = find_contiguous_slot_runs(slots_1d)
             self.common_ratio_to_sas_metadata["contiguous_slot_runs"] = contiguous_slot_runs
             run_lens = [length for _, length, _ in contiguous_slot_runs]
             covered = sum(run_lens)
+            slots_cpu = slots_1d.detach().cpu().reshape(-1)
+            valid_mask = (slots_cpu >= 0) & (slots_cpu != PAD_SLOT_ID)
+            n_valid = int(valid_mask.sum().item())
+            n_invalid = int(n_slots) - n_valid
+            first_invalid = -1
+            if n_invalid > 0:
+                inv = (~valid_mask).nonzero(as_tuple=False)
+                first_invalid = int(inv[0].item()) if inv.numel() else -1
             print(
-                f"[DSA-CP slot_runs] n_slots={n_slots} num_reqs={num_reqs} "
+                f"[DSA-CP slot_runs] n_slots={n_slots} num_input_tokens={num_input_tokens} "
+                f"num_actual_tokens={self.num_actual_tokens} num_reqs={num_reqs} "
+                f"n_valid={n_valid} n_invalid={n_invalid} first_invalid_idx={first_invalid} "
                 f"num_runs={len(contiguous_slot_runs)} covered={covered} "
                 f"max_run={max(run_lens) if run_lens else 0} "
                 f"min_run={min(run_lens) if run_lens else 0} "
+                f"slot[0]={int(slots_cpu[0]) if n_slots else 'na'} "
+                f"slot[n_valid-1]={int(slots_cpu[n_valid - 1]) if n_valid else 'na'} "
+                f"slot[first_invalid]={int(slots_cpu[first_invalid]) if first_invalid >= 0 else 'na'} "
+                f"slot[-1]={int(slots_cpu[-1]) if n_slots else 'na'} "
                 f"runs(token_start,len,slot_start)={contiguous_slot_runs[:16]}"
                 f"{'...' if len(contiguous_slot_runs) > 16 else ''}",
                 flush=True,
@@ -442,11 +457,15 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
 
         n_slots = self.num_actual_tokens if self.num_actual_tokens is not None else num_input_tokens
-        contiguous_slot_runs = find_contiguous_slot_runs(slot_mapping[:n_slots])
+        slots_1d = slot_mapping[:n_slots]
+        contiguous_slot_runs = find_contiguous_slot_runs(slots_1d)
         run_lens = [length for _, length, _ in contiguous_slot_runs]
+        slots_cpu = slots_1d.detach().cpu().reshape(-1)
+        valid_mask = (slots_cpu >= 0) & (slots_cpu != PAD_SLOT_ID)
+        n_valid = int(valid_mask.sum().item())
         print(
             f"[DSA-CP slot_runs][draft={draft_step}] n_slots={n_slots} num_reqs={num_reqs} "
-            f"num_runs={len(contiguous_slot_runs)} covered={sum(run_lens)} "
+            f"n_valid={n_valid} num_runs={len(contiguous_slot_runs)} covered={sum(run_lens)} "
             f"max_run={max(run_lens) if run_lens else 0} "
             f"runs(token_start,len,slot_start)={contiguous_slot_runs[:16]}"
             f"{'...' if len(contiguous_slot_runs) > 16 else ''}",
@@ -1087,6 +1106,49 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         return output
 
+    def _write_swa_kv_cache(
+        self,
+        swa_kv_cache: torch.Tensor,
+        kv: torch.Tensor,
+        swa_slot: torch.Tensor,
+        contiguous_slot_runs: list[ContiguousSlotRun] | None,
+    ) -> None:
+        """Write SWA KV: contiguous runs via ``copy_``, residual via scatter.
+
+        ``contiguous_slot_runs`` entries are ``(token_start, length, slot_start)``
+        in *linear* slot space. ``swa_slot`` is the 2D ``[block_id, offset]``
+        mapping used by ``npu_scatter_nd_update_v2``.
+        """
+        num_tokens = kv.shape[0]
+        if num_tokens == 0:
+            return
+
+        kv_flat = kv.reshape(num_tokens, -1)
+        cache_flat = swa_kv_cache.reshape(-1, kv_flat.shape[-1])
+        covered = torch.zeros(num_tokens, dtype=torch.bool, device=kv.device)
+
+        if contiguous_slot_runs:
+            for token_start, length, slot_start in contiguous_slot_runs:
+                if token_start >= num_tokens or length <= 0:
+                    continue
+                length = min(int(length), num_tokens - int(token_start))
+                if length <= 0:
+                    continue
+                token_start = int(token_start)
+                slot_start = int(slot_start)
+                cache_flat[slot_start : slot_start + length].copy_(
+                    kv_flat[token_start : token_start + length]
+                )
+                covered[token_start : token_start + length] = True
+
+        residual = ~covered
+        if residual.any():
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(
+                swa_kv_cache,
+                swa_slot[:num_tokens][residual].contiguous(),
+                kv[:num_tokens][residual].contiguous(),
+            )
+
     def _forward(
         self,
         layer_name,
@@ -1204,7 +1266,14 @@ class AscendDSACPImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(swa_kv_cache, swa_metadata.req_metadata.slot_mapping, kv)
+        # Contiguous linear-slot runs use copy_; leftover tokens use scatter.
+        num_kv_tokens = kv.shape[0]
+        self._write_swa_kv_cache(
+            swa_kv_cache=swa_kv_cache,
+            kv=kv[:num_kv_tokens],
+            swa_slot=swa_metadata.req_metadata.slot_mapping[:num_kv_tokens],
+            contiguous_slot_runs=req_metadata.contiguous_slot_runs,
+        )
 
         compress_topk_idxs = None
         if self.compress_ratio > 1:
