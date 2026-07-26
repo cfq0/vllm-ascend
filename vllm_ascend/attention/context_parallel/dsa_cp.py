@@ -32,32 +32,38 @@ from vllm_ascend.utils import (
 # (token_start, length, slot_start): slots[token_start + i] == slot_start + i
 ContiguousSlotRun = tuple[int, int, int]
 
-# Runs shorter than this go to the scatter path (avoids tiny copy_ launches).
+# Prefill reqs: runs shorter than this go to scatter (avoids tiny copy_ launches).
+# Decode reqs: use 1 so single-token writes also take the copy_ path.
 MIN_CONTIGUOUS_COPY_LEN = 2
+MIN_CONTIGUOUS_COPY_LEN_DECODE = 1
 
 
 def plan_swa_kv_slot_writes(
     slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
+    num_decodes: int,
     pad_slot_id: int = PAD_SLOT_ID,
-    min_copy_run_len: int = MIN_CONTIGUOUS_COPY_LEN,
     device: torch.device | None = None,
 ) -> tuple[list[ContiguousSlotRun], torch.Tensor]:
-    """Builder-time plan for SWA KV writes: contiguous copy runs + scatter idxs.
+    """Builder-time per-request plan for SWA KV writes.
 
-    ``slot_mapping`` must be the same 1D linear slots that will back
-    ``req_metadata.slot_mapping`` (already clipped to actual / compressed
-    length). Pad (``<0`` or ``pad_slot_id``) breaks runs and is never written.
+    Scans each request's token range ``[query_start_loc[r], query_start_loc[r+1])``
+    independently (batch is decode-then-prefill reordered):
+
+    - Decode requests (``r < num_decodes``): ``min_copy_run_len=1`` → copy_.
+    - Prefill requests: ``min_copy_run_len=2``; length-1 fragments → scatter.
+    - Pad / invalid slots break a run and are never written.
+    - Runs never cross request boundaries.
 
     Returns:
-        contiguous_slot_runs: runs with ``length >= min_copy_run_len`` for
-            ``cache[slot_start:slot_start+length].copy_(kv[token_start:...])``.
-        scatter_token_indices: 1D int32 tensor of token indices that are valid
-            but not covered by those copy runs (short / broken runs).
+        contiguous_slot_runs: ``(token_start, length, slot_start)`` for copy_.
+        scatter_token_indices: token idxs for scatter (prefill short runs).
     """
     if device is None:
         device = slot_mapping.device if slot_mapping is not None else torch.device("cpu")
     empty_idx = torch.empty(0, dtype=torch.int32, device=device)
-    if slot_mapping is None or slot_mapping.numel() == 0:
+    if slot_mapping is None or slot_mapping.numel() == 0 or num_reqs <= 0:
         return [], empty_idx
 
     slots = slot_mapping.detach()
@@ -66,26 +72,46 @@ def plan_swa_kv_slot_writes(
     arr = slots.reshape(-1).numpy()
     if arr.dtype != np.int64:
         arr = arr.astype(np.int64, copy=False)
+    n = int(arr.size)
+
+    qsl = query_start_loc.detach()
+    if qsl.device.type != "cpu":
+        qsl = qsl.cpu()
+    qsl_list = qsl[: num_reqs + 1].tolist()
 
     copy_runs: list[ContiguousSlotRun] = []
     scatter_indices: list[int] = []
-    n = int(arr.size)
-    i = 0
-    while i < n:
-        s = int(arr[i])
-        if s < 0 or s == pad_slot_id:
-            i += 1
+
+    for req_idx in range(num_reqs):
+        req_start = int(qsl_list[req_idx])
+        req_end = int(qsl_list[req_idx + 1])
+        if req_start >= n:
+            break
+        req_end = min(req_end, n)
+        if req_end <= req_start:
             continue
-        token_start = i
-        slot_start = s
-        i += 1
-        while i < n and int(arr[i]) == slot_start + (i - token_start):
+
+        # Reordered batch: decode requests occupy the prefix [0, num_decodes).
+        min_copy_run_len = (
+            MIN_CONTIGUOUS_COPY_LEN_DECODE if req_idx < num_decodes else MIN_CONTIGUOUS_COPY_LEN
+        )
+
+        i = req_start
+        while i < req_end:
+            s = int(arr[i])
+            if s < 0 or s == pad_slot_id:
+                i += 1
+                continue
+            token_start = i
+            slot_start = s
             i += 1
-        length = i - token_start
-        if length >= min_copy_run_len:
-            copy_runs.append((token_start, length, slot_start))
-        else:
-            scatter_indices.extend(range(token_start, token_start + length))
+            while i < req_end and int(arr[i]) == slot_start + (i - token_start):
+                i += 1
+            length = i - token_start
+            if length >= min_copy_run_len:
+                copy_runs.append((token_start, length, slot_start))
+            else:
+                scatter_indices.extend(range(token_start, token_start + length))
 
     if not scatter_indices:
         return copy_runs, empty_idx
@@ -388,17 +414,25 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        # Only SWA (compress_ratio <= 1) needs a KV write plan; compressor /
-        # indexer groups do not call _write_swa_kv_cache. Plan against this
-        # SWA group's own 1D linear slot_mapping (same prefix as req_metadata).
+        # Only SWA (compress_ratio <= 1) needs a KV write plan. Plan per request
+        # using query_start_loc: decode reqs → copy_ (incl. length-1), prefill
+        # reqs → copy_ long runs / scatter short runs.
         contiguous_slot_runs: list[ContiguousSlotRun] | None = None
         scatter_token_indices: torch.Tensor | None = None
         if self.compressor_ratio <= 1:
             n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
             if self.num_actual_tokens is not None:
                 n_slots = min(n_slots, int(self.num_actual_tokens))
+            qsl = (
+                common_attn_metadata.query_start_loc_cpu
+                if common_attn_metadata.query_start_loc_cpu is not None
+                else common_attn_metadata.query_start_loc
+            )
             contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
                 slot_mapping[:n_slots],
+                query_start_loc=qsl,
+                num_reqs=num_reqs,
+                num_decodes=self.num_decodes,
                 device=self.slot_mapping.device,
             )
 
@@ -469,8 +503,17 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         n_slots = min(slot_mapping.shape[0], num_input_tokens)
         if self.num_actual_tokens is not None:
             n_slots = min(n_slots, self.num_actual_tokens)
+        qsl = (
+            common_attn_metadata.query_start_loc_cpu
+            if common_attn_metadata.query_start_loc_cpu is not None
+            else common_attn_metadata.query_start_loc
+        )
+        # Draft: treat every request as decode-like (copy_ including length-1).
         contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
             slot_mapping[:n_slots],
+            query_start_loc=qsl,
+            num_reqs=num_reqs,
+            num_decodes=num_reqs,
             device=self.spec_slot_mapping[0].device,
         )
 
