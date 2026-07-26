@@ -388,22 +388,19 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        # Plan from *this* kv-cache group's slot_mapping. Do NOT cache the plan
-        # in shared common_ratio_to_sas_metadata: that dict is reused across
-        # kv_cache_gid in model_runner, and each group has a different
-        # slot_mapping. Reusing another group's plan causes wrong copy_ writes.
-        n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
-        if self.num_actual_tokens is not None:
-            n_slots = min(n_slots, int(self.num_actual_tokens))
-        if self.compressor_ratio > 1:
-            n_slots = min(
-                n_slots,
-                int(self._get_slot_mapping_size(input_positions_cpu, self.compressor_ratio)),
+        # Only SWA (compress_ratio <= 1) needs a KV write plan; compressor /
+        # indexer groups do not call _write_swa_kv_cache. Plan against this
+        # SWA group's own 1D linear slot_mapping (same prefix as req_metadata).
+        contiguous_slot_runs: list[ContiguousSlotRun] | None = None
+        scatter_token_indices: torch.Tensor | None = None
+        if self.compressor_ratio <= 1:
+            n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
+            if self.num_actual_tokens is not None:
+                n_slots = min(n_slots, int(self.num_actual_tokens))
+            contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
+                slot_mapping[:n_slots],
+                device=self.slot_mapping.device,
             )
-        contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
-            slot_mapping[:n_slots],
-            device=self.slot_mapping.device,
-        )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
 
