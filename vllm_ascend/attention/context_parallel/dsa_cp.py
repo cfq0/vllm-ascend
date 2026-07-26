@@ -32,23 +32,34 @@ from vllm_ascend.utils import (
 # (token_start, length, slot_start): slots[token_start + i] == slot_start + i
 ContiguousSlotRun = tuple[int, int, int]
 
+# Runs shorter than this go to the scatter path (avoids tiny copy_ launches).
+MIN_CONTIGUOUS_COPY_LEN = 2
 
-def find_contiguous_slot_runs(
+
+def plan_swa_kv_slot_writes(
     slot_mapping: torch.Tensor,
     pad_slot_id: int = PAD_SLOT_ID,
-) -> list[ContiguousSlotRun]:
-    """Scan linear slot ids on CPU and return contiguous runs.
+    min_copy_run_len: int = MIN_CONTIGUOUS_COPY_LEN,
+    device: torch.device | None = None,
+) -> tuple[list[ContiguousSlotRun], torch.Tensor]:
+    """Builder-time plan for SWA KV writes: contiguous copy runs + scatter idxs.
 
-    Each run is ``(token_start, length, slot_start)`` such that for all
-    ``i in [0, length)``:
-        ``slot_mapping[token_start + i] == slot_start + i``.
+    ``slot_mapping`` must be the same 1D linear slots that will back
+    ``req_metadata.slot_mapping`` (already clipped to actual / compressed
+    length). Pad (``<0`` or ``pad_slot_id``) breaks runs and is never written.
 
-    Pad / invalid slots (``< 0`` or ``pad_slot_id``) break a run and are skipped.
-    Intended for builder-time planning so forward can ``copy_`` long runs into
-    a flattened KV cache and only scatter the residual gaps.
+    Returns:
+        contiguous_slot_runs: runs with ``length >= min_copy_run_len`` for
+            ``cache[slot_start:slot_start+length].copy_(kv[token_start:...])``.
+        scatter_token_indices: 1D int32 tensor of token indices that are valid
+            but not covered by those copy runs (short / broken runs).
     """
+    if device is None:
+        device = slot_mapping.device if slot_mapping is not None else torch.device("cpu")
+    empty_idx = torch.empty(0, dtype=torch.int32, device=device)
     if slot_mapping is None or slot_mapping.numel() == 0:
-        return []
+        return [], empty_idx
+
     slots = slot_mapping.detach()
     if slots.device.type != "cpu":
         slots = slots.cpu()
@@ -56,7 +67,8 @@ def find_contiguous_slot_runs(
     if arr.dtype != np.int64:
         arr = arr.astype(np.int64, copy=False)
 
-    runs: list[ContiguousSlotRun] = []
+    copy_runs: list[ContiguousSlotRun] = []
+    scatter_indices: list[int] = []
     n = int(arr.size)
     i = 0
     while i < n:
@@ -69,8 +81,15 @@ def find_contiguous_slot_runs(
         i += 1
         while i < n and int(arr[i]) == slot_start + (i - token_start):
             i += 1
-        runs.append((token_start, i - token_start, slot_start))
-    return runs
+        length = i - token_start
+        if length >= min_copy_run_len:
+            copy_runs.append((token_start, length, slot_start))
+        else:
+            scatter_indices.extend(range(token_start, token_start + length))
+
+    if not scatter_indices:
+        return copy_runs, empty_idx
+    return copy_runs, torch.tensor(scatter_indices, dtype=torch.int32, device=device)
 
 
 if HAS_TRITON:
@@ -146,9 +165,11 @@ class AscendDSAReqMetadata:
     qli_metadata: torch.Tensor = None
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
-    # Builder-time contiguous linear-slot runs for SWA KV write planning:
-    # list of (token_start, length, slot_start). See find_contiguous_slot_runs.
+    # Builder-time SWA KV write plan (see plan_swa_kv_slot_writes):
+    # - contiguous_slot_runs: (token_start, length, slot_start) for copy_
+    # - scatter_token_indices: token idxs not in those runs, for scatter
     contiguous_slot_runs: list[ContiguousSlotRun] | None = None
+    scatter_token_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -367,11 +388,25 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        # Plan contiguous linear-slot runs once per step for this kv group.
+        # Plan SWA KV copy/scatter once per step. Length must match the
+        # slot_mapping later stored in req_metadata (actual tokens, and
+        # compressed count when compressor_ratio > 1). Trailing CG / TP pads
+        # beyond that length are excluded from the plan.
         if self.common_ratio_to_sas_metadata.get("contiguous_slot_runs") is None:
-            n_slots = self.num_actual_tokens if self.num_actual_tokens is not None else num_input_tokens
-            contiguous_slot_runs = find_contiguous_slot_runs(slot_mapping[:n_slots])
+            n_slots = min(slot_mapping.shape[0], num_input_tokens)
+            if self.num_actual_tokens is not None:
+                n_slots = min(n_slots, self.num_actual_tokens)
+            if self.compressor_ratio > 1:
+                n_slots = min(
+                    n_slots,
+                    int(self._get_slot_mapping_size(input_positions_cpu, self.compressor_ratio)),
+                )
+            contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
+                slot_mapping[:n_slots],
+                device=self.slot_mapping.device,
+            )
             self.common_ratio_to_sas_metadata["contiguous_slot_runs"] = contiguous_slot_runs
+            self.common_ratio_to_sas_metadata["scatter_token_indices"] = scatter_token_indices
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
 
@@ -430,8 +465,13 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        n_slots = self.num_actual_tokens if self.num_actual_tokens is not None else num_input_tokens
-        contiguous_slot_runs = find_contiguous_slot_runs(slot_mapping[:n_slots])
+        n_slots = min(slot_mapping.shape[0], num_input_tokens)
+        if self.num_actual_tokens is not None:
+            n_slots = min(n_slots, self.num_actual_tokens)
+        contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
+            slot_mapping[:n_slots],
+            device=self.spec_slot_mapping[0].device,
+        )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         req_metadata = self.build_req_metadata_for_drafting(
@@ -440,6 +480,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             input_positions=input_positions,
             num_input_tokens=num_input_tokens,
             contiguous_slot_runs=contiguous_slot_runs,
+            scatter_token_indices=scatter_token_indices,
         )
 
         return self.metadata_cls(  # type: ignore
@@ -467,6 +508,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         input_positions: torch.Tensor,
         num_input_tokens: int,
         contiguous_slot_runs: list[ContiguousSlotRun] | None = None,
+        scatter_token_indices: torch.Tensor | None = None,
     ) -> AscendDSAReqMetadata:
         """Build DSA-CP metadata for one draft step."""
         num_reqs = common_attn_metadata.num_reqs
@@ -566,6 +608,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata=None,
             cu_cmp_seqlen_list=None,
             contiguous_slot_runs=contiguous_slot_runs,
+            scatter_token_indices=scatter_token_indices,
         )
 
     def build_req_metadata(
@@ -700,6 +743,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata=qli_metadata,
             cu_cmp_seqlen_list=cu_cmp_seqlens,
             contiguous_slot_runs=self.common_ratio_to_sas_metadata.get("contiguous_slot_runs"),
+            scatter_token_indices=self.common_ratio_to_sas_metadata.get("scatter_token_indices"),
         )
 
     def _build_local_token_metadata(
@@ -1073,45 +1117,52 @@ class AscendDSACPImpl(DSAAttentionImpl):
         kv: torch.Tensor,
         swa_slot: torch.Tensor,
         contiguous_slot_runs: list[ContiguousSlotRun] | None,
+        scatter_token_indices: torch.Tensor | None,
     ) -> None:
-        """Write SWA KV: contiguous runs via ``copy_``, residual via scatter.
+        """Write SWA KV from builder plan: ``copy_`` runs, then scatter idxs.
 
-        ``contiguous_slot_runs`` entries are ``(token_start, length, slot_start)``
-        in *linear* slot space. ``swa_slot`` is the 2D ``[block_id, offset]``
-        mapping used by ``npu_scatter_nd_update_v2``.
+        Pad / length rules:
+        - Builder plans only valid linear slots (skips ``PAD_SLOT_ID`` / ``<0``).
+        - After TP ``all_gather`` + unpad, ``kv`` should match ``swa_slot``; if
+          gather pad remains (or metadata is shorter), clamp to
+          ``min(kv, swa_slot)`` so trailing pads are never written.
+        - ``swa_slot`` is 2D ``[block_id, offset]`` for scatter.
         """
-        # kv may include TP/allgather pad tokens beyond the slot_mapping length.
-        num_tokens = min(kv.shape[0], swa_slot.shape[0])
+        num_tokens = min(int(kv.shape[0]), int(swa_slot.shape[0]))
         if num_tokens == 0:
             return
         kv = kv[:num_tokens]
         swa_slot = swa_slot[:num_tokens]
 
-        kv_flat = kv.reshape(num_tokens, -1)
-        cache_flat = swa_kv_cache.reshape(-1, kv_flat.shape[-1])
-        covered = torch.zeros(num_tokens, dtype=torch.bool, device=kv.device)
-
         if contiguous_slot_runs:
+            kv_flat = kv.reshape(num_tokens, -1)
+            cache_flat = swa_kv_cache.reshape(-1, kv_flat.shape[-1])
             for token_start, length, slot_start in contiguous_slot_runs:
-                if token_start >= num_tokens or length <= 0:
+                token_start = int(token_start)
+                if token_start >= num_tokens:
                     continue
-                length = min(int(length), num_tokens - int(token_start))
+                length = min(int(length), num_tokens - token_start)
                 if length <= 0:
                     continue
-                token_start = int(token_start)
                 slot_start = int(slot_start)
                 cache_flat[slot_start : slot_start + length].copy_(
                     kv_flat[token_start : token_start + length]
                 )
-                covered[token_start : token_start + length] = True
 
-        residual = ~covered
-        if bool(residual.any()):
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                swa_kv_cache,
-                swa_slot[residual].contiguous(),
-                kv[residual].contiguous(),
-            )
+        if scatter_token_indices is None or scatter_token_indices.numel() == 0:
+            return
+        idx = scatter_token_indices
+        if idx.device != kv.device:
+            idx = idx.to(device=kv.device, non_blocking=True)
+        # Drop any idx beyond clamped length (defensive vs TP gather pad).
+        idx = idx[idx < num_tokens].long()
+        if idx.numel() == 0:
+            return
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            swa_kv_cache,
+            swa_slot[idx].contiguous(),
+            kv[idx].contiguous(),
+        )
 
     def _forward(
         self,
@@ -1230,14 +1281,13 @@ class AscendDSACPImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
-        # Contiguous linear-slot runs use copy_; leftover tokens use scatter.
-        # Use SWA metadata's runs/slots (not compressor group's) and clamp to
-        # slot_mapping length so TP/allgather pad tokens are not written.
+        # Builder-planned copy runs + scatter idxs (SWA metadata only).
         self._write_swa_kv_cache(
             swa_kv_cache=swa_kv_cache,
             kv=kv,
             swa_slot=swa_metadata.req_metadata.slot_mapping,
             contiguous_slot_runs=swa_metadata.req_metadata.contiguous_slot_runs,
+            scatter_token_indices=swa_metadata.req_metadata.scatter_token_indices,
         )
 
         compress_topk_idxs = None
