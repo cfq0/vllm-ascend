@@ -9,6 +9,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     KVCacheCoordinator,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -19,9 +20,48 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 
+from vllm_ascend import envs
+from vllm_ascend.core.pd_block_pool import PDBlockPool, PDBlockPoolConfig
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 
 USE_MULTI_GROUPS_KV_CACHE = True
+
+
+def _build_block_pool(
+    num_blocks: int,
+    enable_caching: bool,
+    hash_block_size: int,
+    enable_kv_cache_events: bool,
+    metrics_collector: KVCacheMetricsCollector | None,
+) -> BlockPool:
+    """Construct BlockPool or PD-partitioned BlockPool (env-gated)."""
+    if not envs.VLLM_ASCEND_ENABLE_PD_BLOCK_POOL:
+        return BlockPool(
+            num_blocks,
+            enable_caching,
+            hash_block_size,
+            enable_kv_cache_events,
+            metrics_collector,
+        )
+    if enable_caching:
+        raise ValueError(
+            "VLLM_ASCEND_ENABLE_PD_BLOCK_POOL=1 requires prefix caching disabled "
+            "(enable_prefix_caching / enable_caching must be False)"
+        )
+    pd_config = PDBlockPoolConfig(
+        num_gpu_blocks=num_blocks,
+        max_num_decode_reqs=envs.VLLM_ASCEND_PD_MAX_NUM_DECODE_REQS,
+        max_blocks_per_decode_req=envs.VLLM_ASCEND_PD_MAX_BLOCKS_PER_DECODE_REQ,
+        num_decode_blocks=envs.VLLM_ASCEND_PD_NUM_DECODE_BLOCKS,
+    )
+    return PDBlockPool(
+        num_gpu_blocks=num_blocks,
+        enable_caching=False,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=enable_kv_cache_events,
+        metrics_collector=metrics_collector,
+        pd_config=pd_config,
+    )
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -57,7 +97,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             max_num_batched_tokens = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        self.block_pool = BlockPool(
+        self.block_pool = _build_block_pool(
             kv_cache_config.num_blocks,
             enable_caching,
             hash_block_size,
@@ -282,3 +322,26 @@ vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator = get_kv_cache_coordi
 _kv_cache_manager = sys.modules.get("vllm.v1.core.kv_cache_manager")
 if _kv_cache_manager is not None:
     _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
+
+
+# Mark alloc region (prefill vs decode) on PDBlockPool for the duration of
+# allocate_slots so get_num_free_blocks / get_new_blocks use the right region.
+_original_allocate_slots = KVCacheManager.allocate_slots
+
+
+def _allocate_slots_with_pd_region(self: KVCacheManager, request, *args, **kwargs):
+    pool = self.block_pool
+    if not isinstance(pool, PDBlockPool):
+        return _original_allocate_slots(self, request, *args, **kwargs)
+    # Still in prompt → prefill region; otherwise decode region.
+    # Prefill-allocated blocks stay with the request through decode and are
+    # freed by id-range back to the prefill region when the request finishes.
+    is_prefill = request.num_computed_tokens < request.num_prompt_tokens
+    pool.set_alloc_is_prefill(is_prefill)
+    try:
+        return _original_allocate_slots(self, request, *args, **kwargs)
+    finally:
+        pool.clear_alloc_is_prefill()
+
+
+KVCacheManager.allocate_slots = _allocate_slots_with_pd_region  # type: ignore[method-assign]
