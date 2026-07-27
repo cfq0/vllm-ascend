@@ -209,6 +209,11 @@ class PDBlockPool(BlockPool):
                 "PDBlockPool does not support prefix caching yet; "
                 "disable enable_prefix_caching / enable_caching first"
             )
+        print(
+            f"[PDBlockPool] __init__ start num_gpu_blocks={num_gpu_blocks} "
+            f"hash_block_size={hash_block_size}",
+            flush=True,
+        )
         super().__init__(
             num_gpu_blocks,
             enable_caching,
@@ -216,6 +221,7 @@ class PDBlockPool(BlockPool):
             enable_kv_cache_events,
             metrics_collector,
         )
+        print("[PDBlockPool] BlockPool super().__init__ done", flush=True)
         if pd_config is None:
             pd_config = PDBlockPoolConfig(num_gpu_blocks=num_gpu_blocks)
         elif pd_config.num_gpu_blocks != num_gpu_blocks:
@@ -230,24 +236,30 @@ class PDBlockPool(BlockPool):
 
         # Drain BlockPool free-list; ownership moves to PD regions.
         n_free = self.free_block_queue.num_free_blocks
+        print(f"[PDBlockPool] draining free_block_queue n_free={n_free}", flush=True)
         if n_free > 0:
             self.free_block_queue.popleft_n(n_free)
         assert self.free_block_queue.num_free_blocks == 0
 
+        print(
+            f"[PDBlockPool] building regions prefill=[{prefill_start},{prefill_end}) "
+            f"decode=[{prefill_end},{decode_end})",
+            flush=True,
+        )
         self.prefill = _PrefillBumpRegion(prefill_start, prefill_end)
+        print("[PDBlockPool] prefill region ready", flush=True)
         self.decode = _DecodeFreeListRegion(prefill_end, decode_end)
+        print("[PDBlockPool] decode region ready", flush=True)
         # None = unset (treat as total free for get_num_free_blocks).
         self._alloc_is_prefill: bool | None = None
 
-        logger.info(
-            "PDBlockPool enabled: prefill=[%d,%d) (%d blocks), decode=[%d,%d) (%d blocks)",
-            prefill_start,
-            prefill_end,
-            prefill_end - prefill_start,
-            prefill_end,
-            decode_end,
-            decode_end - prefill_end,
+        msg = (
+            f"PDBlockPool enabled: prefill=[{prefill_start},{prefill_end}) "
+            f"({prefill_end - prefill_start} blocks), "
+            f"decode=[{prefill_end},{decode_end}) ({decode_end - prefill_end} blocks)"
         )
+        logger.info(msg)
+        print(f"[PDBlockPool] {msg}", flush=True)
 
     @property
     def prefill_range(self) -> tuple[int, int]:
@@ -294,17 +306,22 @@ class PDBlockPool(BlockPool):
 
         if is_prefill:
             ids = self.prefill.allocate_contiguous(num_blocks)
-            logger.info(
-                "PDBlockPool prefill alloc: n=%d ids=%s (range=[%d,%d) free=%d/%d)",
-                num_blocks,
-                ids,
-                self.prefill.start,
-                self.prefill.end,
-                self.prefill.num_free,
-                self.prefill.capacity,
+            msg = (
+                f"PDBlockPool prefill alloc: n={num_blocks} ids={ids} "
+                f"(range=[{self.prefill.start},{self.prefill.end}) "
+                f"free={self.prefill.num_free}/{self.prefill.capacity})"
             )
+            logger.info(msg)
+            print(f"[PDBlockPool] {msg}", flush=True)
         else:
             ids = self.decode.allocate(num_blocks)
+            msg = (
+                f"PDBlockPool decode alloc: n={num_blocks} ids={ids} "
+                f"(range=[{self.decode.start},{self.decode.end}) "
+                f"free={self.decode.num_free})"
+            )
+            logger.info(msg)
+            print(f"[PDBlockPool] {msg}", flush=True)
 
         ret = [self.blocks[bid] for bid in ids]
         for block in ret:
@@ -332,6 +349,13 @@ class PDBlockPool(BlockPool):
                 decode_ids.append(bid)
             else:
                 raise ValueError(f"block {bid} outside PD regions {self.summary()}")
+        if prefill_ids or decode_ids:
+            print(
+                f"[PDBlockPool] free: prefill_ids={prefill_ids} decode_ids={decode_ids} "
+                f"-> prefill_free={self.prefill.num_free + len(prefill_ids)} "
+                f"decode_free={self.decode.num_free + len(decode_ids)}",
+                flush=True,
+            )
         if prefill_ids:
             self.prefill.free(prefill_ids)
         if decode_ids:
