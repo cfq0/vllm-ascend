@@ -7,8 +7,9 @@ prefill contiguous runs (important for DSA-CP SWA ``copy_`` writes).
 
 Scope (current):
 - Prefix cache / PCP / MTP are not supported; enable only with caching off.
-- Prefill: bump allocator that hands out **id-contiguous** spans; wraps and
-  searches for the next free contiguous span.
+- Prefill: bump allocator that prefers **id-contiguous** spans; on
+  fragmentation, binary-searches the largest free contiguous chunk and
+  repeats until the request is filled (may return several runs).
 - Decode: free-list sized for a small concurrent decode batch (default 32 reqs).
 - Free routes by block-id range back to the owning region.
 """
@@ -96,25 +97,43 @@ class _PrefillBumpRegion:
         return self._num_free
 
     def allocate_contiguous(self, n: int) -> list[int]:
+        """Allocate ``n`` free blocks, preferring long contiguous id runs.
+
+        1. Try one contiguous span of length ``n``.
+        2. If fragmented, repeatedly binary-search the largest feasible
+           contiguous span ``k <= remaining`` and take it, until ``n`` is met.
+           Result may be several contiguous runs (still better than random ids).
+        """
         if n <= 0:
             return []
         if n > self._num_free:
             raise ValueError(f"prefill region: need {n} free blocks, only {self._num_free} left")
-        # Prefer a contiguous span of length n. Search from cursor, wrap once.
+
+        # Fast path: one contiguous span.
         span = self._find_contiguous_span(n)
-        if span is None:
-            raise ValueError(
-                f"prefill region: {self._num_free} free blocks but no contiguous "
-                f"span of length {n} (fragmented)"
-            )
-        first = span
-        out = list(range(first, first + n))
-        for bid in out:
-            self._mark_used(bid)
-        # Advance cursor just past the allocated span (wrap).
-        self._cursor = first + n
-        if self._cursor >= self.end:
-            self._cursor = self.start
+        if span is not None:
+            return self._take_span(span, n)
+
+        # Fragmented: keep taking the largest contiguous chunk via binary search.
+        out: list[int] = []
+        remaining = n
+        runs: list[tuple[int, int]] = []
+        while remaining > 0:
+            first, length = self._find_largest_contiguous_span(remaining)
+            if length <= 0 or first is None:
+                raise ValueError(
+                    f"prefill region: need {n} blocks, allocated {n - remaining}, "
+                    f"free={self._num_free} but no free contiguous span left (fragmented)"
+                )
+            out.extend(self._take_span(first, length))
+            runs.append((first, length))
+            remaining -= length
+
+        print(
+            f"[PDBlockPool] prefill split alloc: need={n} runs={runs} "
+            f"(binary-search largest span until filled)",
+            flush=True,
+        )
         return out
 
     def free(self, block_ids: list[int]) -> None:
@@ -123,18 +142,48 @@ class _PrefillBumpRegion:
                 raise ValueError(f"block {bid} not in prefill region [{self.start}, {self.end})")
             self._mark_free(bid)
 
+    def _take_span(self, first: int, n: int) -> list[int]:
+        out = list(range(first, first + n))
+        for bid in out:
+            self._mark_used(bid)
+        self._cursor = first + n
+        if self._cursor >= self.end:
+            self._cursor = self.start
+        return out
+
     def _find_contiguous_span(self, n: int) -> int | None:
         """Return start id of a free contiguous span of length n, or None."""
-        if n > self.capacity:
+        if n <= 0 or n > self.capacity:
             return None
-        # Linear scan with wrap: try up to ``capacity`` start positions.
-        # A single allocation must not wrap across the region end (page ids
-        # would jump and break contiguous slot runs).
+        # Linear scan with wrap from cursor. A single span must not wrap past end.
         for offset in range(self.capacity):
             first = self.start + ((self._cursor - self.start + offset) % self.capacity)
             if first + n <= self.end and self._is_free_range(first, n):
                 return first
         return None
+
+    def _find_largest_contiguous_span(self, max_n: int) -> tuple[int | None, int]:
+        """Binary-search the largest ``k in [1, max_n]`` with a free contiguous span.
+
+        Returns ``(start_id, k)`` or ``(None, 0)`` if nothing free.
+        """
+        max_n = min(max_n, self._num_free, self.capacity)
+        if max_n <= 0:
+            return None, 0
+
+        lo, hi = 1, max_n
+        best_first: int | None = None
+        best_k = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            first = self._find_contiguous_span(mid)
+            if first is not None:
+                best_first = first
+                best_k = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best_first, best_k
 
     def _is_free_range(self, first: int, n: int) -> bool:
         base = first - self.start

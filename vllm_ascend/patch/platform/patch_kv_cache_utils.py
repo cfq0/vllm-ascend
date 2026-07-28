@@ -229,17 +229,32 @@ def _get_kv_cache_config_deepseek_v4(
     num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
+    def layers_at(layer_pos: int, page_size: int) -> list[str]:
+        """Collect layer names from every group at this (layer_pos, page_size)."""
+        names: list[str] = []
+        for group_buckets in bucketed:
+            layers = group_buckets.get(page_size)
+            if layers is not None and layer_pos < len(layers):
+                names.append(layers[layer_pos])
+        return names
+
+    # One physical buffer per (layer position, page size).
+    # Example: layer_pos=0, page_size=100 → L0.c4_idx and L0.swa share one tensor.
     kv_cache_tensors: list[KVCacheTensor] = []
-    for tuple_idx in range(num_layer_tuples - len(mtp_layer_names)):
-        for ps in page_sizes:
-            shared_by: list[str] = []
-            for b in bucketed:
-                bucket = b.get(ps)
-                if bucket is not None and tuple_idx < len(bucket):
-                    shared_by.append(bucket[tuple_idx])
-            kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=shared_by))
-    for i in range(len(mtp_layer_names)):
-        kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
+    num_attn_layer_pos = num_layer_tuples - len(mtp_layer_names)
+    for layer_pos in range(num_attn_layer_pos):
+        for page_size in page_sizes:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=page_size * num_blocks,
+                    shared_by=layers_at(layer_pos, page_size),
+                )
+            )
+
+    for mtp_name in mtp_layer_names:
+        kv_cache_tensors.append(
+            KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_name])
+        )
 
     return num_blocks, kv_cache_tensors
 
