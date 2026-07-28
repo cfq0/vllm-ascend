@@ -4,7 +4,6 @@ import sys
 from math import lcm
 
 import vllm
-from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -25,15 +24,7 @@ from vllm_ascend import envs
 from vllm_ascend.core.pd_block_pool import PDBlockPool, PDBlockPoolConfig
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 
-logger = init_logger(__name__)
-
 USE_MULTI_GROUPS_KV_CACHE = True
-
-print(
-    f"[PDBlockPool] patch_kv_cache_coordinator loaded; "
-    f"VLLM_ASCEND_ENABLE_PD_BLOCK_POOL={envs.VLLM_ASCEND_ENABLE_PD_BLOCK_POOL}",
-    flush=True,
-)
 
 
 def _build_block_pool(
@@ -45,27 +36,14 @@ def _build_block_pool(
 ) -> BlockPool:
     """Construct BlockPool or PD-partitioned BlockPool (env-gated)."""
     enabled = envs.VLLM_ASCEND_ENABLE_PD_BLOCK_POOL
-    print(
-        f"[PDBlockPool] _build_block_pool enter: num_blocks={num_blocks} "
-        f"enable_caching={enable_caching} pd_enabled={enabled}",
-        flush=True,
-    )
-    logger.info(
-        "PDBlockPool _build_block_pool: num_blocks=%d enable_caching=%s pd_enabled=%s",
-        num_blocks,
-        enable_caching,
-        enabled,
-    )
     if not enabled:
-        pool = BlockPool(
+        return BlockPool(
             num_blocks,
             enable_caching,
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
         )
-        print("[PDBlockPool] using vanilla BlockPool", flush=True)
-        return pool
     if enable_caching:
         raise ValueError(
             "VLLM_ASCEND_ENABLE_PD_BLOCK_POOL=1 requires prefix caching disabled "
@@ -77,12 +55,7 @@ def _build_block_pool(
         max_blocks_per_decode_req=envs.VLLM_ASCEND_PD_MAX_BLOCKS_PER_DECODE_REQ,
         num_decode_blocks=envs.VLLM_ASCEND_PD_NUM_DECODE_BLOCKS,
     )
-    print(
-        f"[PDBlockPool] constructing PDBlockPool config={pd_config} "
-        f"resolved={pd_config.resolve()}",
-        flush=True,
-    )
-    pool = PDBlockPool(
+    return PDBlockPool(
         num_gpu_blocks=num_blocks,
         enable_caching=False,
         hash_block_size=hash_block_size,
@@ -90,8 +63,6 @@ def _build_block_pool(
         metrics_collector=metrics_collector,
         pd_config=pd_config,
     )
-    print(f"[PDBlockPool] _build_block_pool done: {pool.summary()}", flush=True)
-    return pool
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -127,23 +98,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             max_num_batched_tokens = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        print(
-            f"[PDBlockPool] AscendHybridKVCacheCoordinator.__init__ "
-            f"num_blocks={kv_cache_config.num_blocks} "
-            f"num_groups={len(kv_cache_config.kv_cache_groups)} "
-            f"enable_caching={enable_caching}",
-            flush=True,
-        )
         self.block_pool = _build_block_pool(
             kv_cache_config.num_blocks,
             enable_caching,
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
-        )
-        print(
-            f"[PDBlockPool] coordinator block_pool ready type={type(self.block_pool).__name__}",
-            flush=True,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -378,26 +338,11 @@ def _allocate_slots_with_pd_region(self: KVCacheManager, request, *args, **kwarg
     # Prefill-allocated blocks stay with the request through decode and are
     # freed by id-range back to the prefill region when the request finishes.
     is_prefill = request.num_computed_tokens < request.num_prompt_tokens
-    print(
-        f"[PDBlockPool] allocate_slots enter req={request.request_id} "
-        f"is_prefill={is_prefill} computed={request.num_computed_tokens} "
-        f"prompt={request.num_prompt_tokens} "
-        f"prefill_free={pool.prefill.num_free} decode_free={pool.decode.num_free}",
-        flush=True,
-    )
     pool.set_alloc_is_prefill(is_prefill)
     try:
-        result = _original_allocate_slots(self, request, *args, **kwargs)
-        print(
-            f"[PDBlockPool] allocate_slots exit req={request.request_id} "
-            f"ok={result is not None} "
-            f"prefill_free={pool.prefill.num_free} decode_free={pool.decode.num_free}",
-            flush=True,
-        )
-        return result
+        return _original_allocate_slots(self, request, *args, **kwargs)
     finally:
         pool.clear_alloc_is_prefill()
 
 
 KVCacheManager.allocate_slots = _allocate_slots_with_pd_region  # type: ignore[method-assign]
-print("[PDBlockPool] KVCacheManager.allocate_slots patched", flush=True)
