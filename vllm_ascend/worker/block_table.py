@@ -379,19 +379,6 @@ class MultiGroupBlockTable:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:
                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
-        # Debug: print each kv-cache group's block ids per request.
-        self._debug_print_per_req_block_ids(num_reqs)
-
-    def _debug_print_per_req_block_ids(self, num_reqs: int) -> None:
-        for gi, block_table in enumerate(self.block_tables):
-            for req_idx in range(num_reqs):
-                n_blocks = int(block_table.num_blocks_per_row[req_idx])
-                block_ids = block_table.block_table.np[req_idx, :n_blocks].tolist()
-                print(
-                    f"[block_alloc] group={gi} req={req_idx} "
-                    f"n_blocks={n_blocks} block_ids={block_ids}",
-                    flush=True,
-                )
 
     def compute_slot_mapping_draft(
         self,
