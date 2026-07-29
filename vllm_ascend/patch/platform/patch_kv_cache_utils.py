@@ -151,8 +151,16 @@ def _get_kv_cache_groups_uniform_groups(
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
             candidate = size_to_candidate[current_size]
+            padded_before = getattr(layer_spec, "page_size_padded", None)
             if current_size < candidate:
                 object.__setattr__(layer_spec, "page_size_padded", candidate)
+            print(
+                f"[KVPagePad] layer={layer_name} block_size={layer_spec.block_size} "
+                f"page_size_bytes={current_size} unify_candidate={candidate} "
+                f"page_size_padded_before={padded_before} "
+                f"page_size_padded_after={getattr(layer_spec, 'page_size_padded', None)}",
+                flush=True,
+            )
             layers_per_size[candidate].append(layer_name)
         # NOTE(yifan): for now, inside a UniformKV group, each page_size should
         # have the same number of layers. This also means we don't need to pad layers

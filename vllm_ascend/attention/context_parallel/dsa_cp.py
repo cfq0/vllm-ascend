@@ -30,11 +30,12 @@ from vllm_ascend.utils import (
 )
 
 # (token_start, length, slot_start): slots[token_start + t] == slot_start + t
-# Runs are within one physical KV block only (at most block_size tokens).
+# May span multiple consecutive block_ids when linear slots are contiguous.
 ContiguousSlotRun = tuple[int, int, int]
 
 # Prefill: shorter runs go to scatter. Decode never uses copy_runs.
-MIN_CONTIGUOUS_COPY_LEN = 2
+# A copy_ run must cover at least MIN_CONTIGUOUS_BLOCKS consecutive block_ids.
+MIN_CONTIGUOUS_BLOCKS = 2
 # Real SWA uses block_size=128; C4/C128 state caches use 8/32 and must be skipped.
 SWA_KV_BLOCK_SIZE = 128
 
@@ -48,11 +49,11 @@ def plan_swa_kv_slot_writes(
     device: torch.device | None = None,
     block_size: int = 128,
 ) -> tuple[list[ContiguousSlotRun], torch.Tensor]:
-    """Plan SWA KV writes: within-block prefill ``copy_`` runs + scatter idxs.
+    """Plan SWA KV writes: consecutive-block prefill ``copy_`` runs + scatter.
 
     - Decode (``req_idx < num_decodes``): all valid tokens → scatter.
-    - Prefill: consecutive slots in the **same block** with
-      ``length >= MIN_CONTIGUOUS_COPY_LEN`` → copy_; else scatter.
+    - Prefill: tokens whose block_ids are consecutive (>= MIN_CONTIGUOUS_BLOCKS)
+      → one copy_ run covering all those blocks.
     """
     if device is None:
         device = slot_mapping.device if slot_mapping is not None else torch.device("cpu")
@@ -88,42 +89,54 @@ def plan_swa_kv_slot_writes(
 
         # Decode: scatter only (never record copy_runs).
         if req_idx < num_decodes:
-            for token_idx in range(begin, end):
-                slot_id = int(slot_ids[token_idx])
-                if slot_id >= 0 and slot_id != pad_slot_id:
-                    scatter_idxs.append(token_idx)
+            seg = slot_ids[begin:end]
+            valid = (seg >= 0) & (seg != pad_slot_id)
+            scatter_idxs.extend((np.flatnonzero(valid) + begin).tolist())
             continue
 
-        # Prefill: jump to block boundary instead of extending token-by-token.
-        token_idx = begin
-        while token_idx < end:
-            slot_id = int(slot_ids[token_idx])
-            if slot_id < 0 or slot_id == pad_slot_id:
-                token_idx += 1
-                continue
+        # Prefill (vectorized): split into consecutive-slot runs, then
+        # copy_ if the run spans >= MIN_CONTIGUOUS_BLOCKS block_ids.
+        seg = slot_ids[begin:end]
+        n = int(seg.size)
+        if n == 0:
+            continue
+        valid = (seg >= 0) & (seg != pad_slot_id)
+        # Break before i unless i continues a consecutive valid slot from i-1.
+        new_run = np.empty(n, dtype=bool)
+        new_run[0] = True
+        new_run[1:] = ~(valid[1:] & valid[:-1] & (seg[1:] == seg[:-1] + 1))
+        run_ids = np.cumsum(new_run)
 
-            # Max contiguous span physically possible: to the end of this block.
-            room_in_block = block_size - (slot_id % block_size)
-            cand_len = min(end - token_idx, room_in_block)
-            segment = slot_ids[token_idx : token_idx + cand_len]
-            expected = slot_id + np.arange(cand_len, dtype=np.int64)
-            ok = (segment == expected) & (segment >= 0) & (segment != pad_slot_id)
-            run_len = cand_len if bool(ok.all()) else int(np.argmax(~ok))
+        v_pos = np.flatnonzero(valid)
+        if v_pos.size == 0:
+            continue
+        v_run = run_ids[v_pos]
+        # Group starts within valid tokens (run_id changes).
+        grp_start = np.empty(v_pos.size, dtype=bool)
+        grp_start[0] = True
+        grp_start[1:] = v_run[1:] != v_run[:-1]
+        g0 = np.flatnonzero(grp_start)
+        g1 = np.empty(g0.size, dtype=np.int64)
+        g1[:-1] = g0[1:]
+        g1[-1] = v_pos.size
 
-            if run_len >= MIN_CONTIGUOUS_COPY_LEN:
-                copy_runs.append((token_idx, run_len, slot_id))
+        for gs, ge in zip(g0.tolist(), g1.tolist()):
+            tok_start = begin + int(v_pos[gs])
+            run_len = int(ge - gs)
+            slot_start = int(seg[v_pos[gs]])
+            start_block = slot_start // block_size
+            end_block = (slot_start + run_len - 1) // block_size
+            num_blocks = end_block - start_block + 1
+            if num_blocks >= MIN_CONTIGUOUS_BLOCKS:
+                copy_runs.append((tok_start, run_len, slot_start))
                 print(
-                    f"[KVSlotPlan] copy_run token_start={token_idx} "
-                    f"run_len={run_len} slot_start={slot_id} "
-                    f"block_id={slot_id // block_size}",
+                    f"[KVSlotPlan] copy_run token_start={tok_start} "
+                    f"run_len={run_len} slot_start={slot_start} "
+                    f"block_ids=[{start_block}..{end_block}] num_blocks={num_blocks}",
                     flush=True,
                 )
-            elif run_len > 0:
-                scatter_idxs.extend(range(token_idx, token_idx + run_len))
             else:
-                # Should not happen for a valid start slot; skip one to make progress.
-                run_len = 1
-            token_idx += run_len
+                scatter_idxs.extend(range(tok_start, tok_start + run_len))
 
     if not scatter_idxs:
         return copy_runs, empty_scatter
@@ -204,7 +217,7 @@ class AscendDSAReqMetadata:
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
     # Builder-time SWA KV write plan (see plan_swa_kv_slot_writes):
-    # - contiguous_slot_runs: within-block prefill copy_ (len >= 2)
+    # - contiguous_slot_runs: consecutive-slot prefill copy_ (may span blocks)
     # - scatter_token_indices: decode + short prefill fragments
     contiguous_slot_runs: list[ContiguousSlotRun] | None = None
     scatter_token_indices: torch.Tensor | None = None
@@ -427,7 +440,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
 
         # Only real SWA KV (block_size=128). Skip C4/C128 state caches (8/32).
-        # Decode → scatter; prefill → within-block copy_ (len>=2) / scatter short.
+        # Decode → scatter; prefill → consecutive-slot copy_ (may span blocks).
         contiguous_slot_runs: list[ContiguousSlotRun] | None = None
         scatter_token_indices: torch.Tensor | None = None
         plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
@@ -1184,18 +1197,18 @@ class AscendDSACPImpl(DSAAttentionImpl):
         contiguous_slot_runs: list[ContiguousSlotRun] | None,
         scatter_token_indices: torch.Tensor | None,
     ) -> None:
-        """Write SWA KV: within-block ``copy_`` runs, then scatter."""
+        """Write SWA KV: consecutive-slot ``copy_`` runs (may span blocks), then scatter."""
         if contiguous_slot_runs:
-            block_size = int(swa_kv_cache.shape[1])
+            num_tokens = kv.shape[0]
+            kv_flat = kv.reshape(num_tokens, -1)
+            cache_flat = swa_kv_cache.reshape(-1, kv_flat.shape[-1])
             for token_start, length, slot_start in contiguous_slot_runs:
                 token_start = int(token_start)
                 length = int(length)
                 slot_start = int(slot_start)
-                block_id = slot_start // block_size
-                offset = slot_start % block_size
-                dst = swa_kv_cache[block_id, offset : offset + length]
-                src = kv[token_start : token_start + length]
-                dst.reshape(length, -1).copy_(src.reshape(length, -1))
+                cache_flat[slot_start : slot_start + length].copy_(
+                    kv_flat[token_start : token_start + length]
+                )
 
         if scatter_token_indices is None or scatter_token_indices.numel() == 0:
             return
