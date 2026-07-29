@@ -35,6 +35,8 @@ ContiguousSlotRun = tuple[int, int, int]
 
 # Prefill: shorter runs go to scatter. Decode never uses copy_runs.
 MIN_CONTIGUOUS_COPY_LEN = 2
+# Real SWA uses block_size=128; C4/C128 state caches use 8/32 and must be skipped.
+SWA_KV_BLOCK_SIZE = 128
 
 
 def plan_swa_kv_slot_writes(
@@ -424,11 +426,12 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        # Only SWA (compress_ratio <= 1) needs a KV write plan.
+        # Only real SWA KV (block_size=128). Skip C4/C128 state caches (8/32).
         # Decode → scatter; prefill → within-block copy_ (len>=2) / scatter short.
         contiguous_slot_runs: list[ContiguousSlotRun] | None = None
         scatter_token_indices: torch.Tensor | None = None
-        if self.compressor_ratio <= 1:
+        plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
+        if self.compressor_ratio <= 1 and plan_block_size == SWA_KV_BLOCK_SIZE:
             n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
             if self.num_actual_tokens is not None:
                 n_slots = min(n_slots, int(self.num_actual_tokens))
@@ -443,7 +446,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_reqs=num_reqs,
                 num_decodes=self.num_decodes,
                 device=self.slot_mapping.device,
-                block_size=int(self.block_size) if self.block_size is not None else 128,
+                block_size=plan_block_size,
             )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
@@ -519,14 +522,19 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             else common_attn_metadata.query_start_loc
         )
         # Draft is decode-like: all tokens → scatter (no copy_runs).
-        contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
-            slot_mapping[:n_slots],
-            query_start_loc=qsl,
-            num_reqs=num_reqs,
-            num_decodes=num_reqs,
-            device=self.spec_slot_mapping[0].device,
-            block_size=int(self.block_size) if self.block_size is not None else 128,
-        )
+        # Only real SWA (block_size=128); skip state caches (8/32).
+        contiguous_slot_runs: list[ContiguousSlotRun] | None = None
+        scatter_token_indices: torch.Tensor | None = None
+        plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
+        if plan_block_size == SWA_KV_BLOCK_SIZE:
+            contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
+                slot_mapping[:n_slots],
+                query_start_loc=qsl,
+                num_reqs=num_reqs,
+                num_decodes=num_reqs,
+                device=self.spec_slot_mapping[0].device,
+                block_size=plan_block_size,
+            )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         req_metadata = self.build_req_metadata_for_drafting(
