@@ -5,9 +5,20 @@
 Splits the physical block-id space so decode single-block pops cannot fragment
 prefill contiguous runs (important for DSA-CP SWA ``copy_`` writes).
 
+Layout (null block at 0)::
+
+    [1, 1+SWA)     SWA bump (real SWA block_size=128, **prefill only**)
+    [1+SWA, P)     non-SWA prefill bump (C4/C128 + state caches)
+    [P, N)         decode free-list (all groups, including SWA in decode)
+
+Routing:
+- Prefill + real SWA → SWA bump (keeps contiguous ids for ``copy_``).
+- Prefill + other → prefill bump.
+- Decode (any group) → decode free-list (avoids punching holes in SWA).
+
 Scope (current):
 - Prefix cache / PCP / MTP are not supported; enable only with caching off.
-- Prefill: bump allocator that prefers **id-contiguous** spans; on
+- Prefill / SWA: bump allocator that prefers **id-contiguous** spans; on
   fragmentation, binary-searches the largest free contiguous chunk and
   repeats until the request is filled (may return several runs).
 - Decode: free-list sized for a small concurrent decode batch (default 32 reqs).
@@ -27,13 +38,16 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
 
+# Real SWA: 32 concurrent reqs * 8k tokens / block_size 128.
+SWA_KV_BLOCK_REGION_SIZE = 2048
+
 
 @dataclass(frozen=True)
 class PDBlockPoolConfig:
     """Partition layout for one KV-cache group's block ids.
 
     Block 0 is reserved as the null block (same convention as vLLM BlockPool).
-    Remaining ids ``[1, num_gpu_blocks)`` are split into prefill then decode.
+    Remaining ids are split into SWA, then non-SWA prefill, then decode.
     """
 
     num_gpu_blocks: int
@@ -47,11 +61,14 @@ class PDBlockPoolConfig:
     num_decode_blocks: int | None = None
     # Keep a null block at id 0.
     reserve_null_block: bool = True
+    # Fixed SWA id region size (real SWA block_size=128).
+    num_swa_blocks: int = SWA_KV_BLOCK_REGION_SIZE
 
-    def resolve(self) -> tuple[int, int, int, int]:
-        """Return ``(null_id, prefill_start, prefill_end, decode_end)``.
+    def resolve(self) -> tuple[int, int, int, int, int]:
+        """Return ``(null_id, swa_start, swa_end, prefill_end, decode_end)``.
 
-        Prefill owns ``[prefill_start, prefill_end)``.
+        SWA owns ``[swa_start, swa_end)``.
+        Non-SWA prefill owns ``[swa_end, prefill_end)``.
         Decode owns ``[prefill_end, decode_end)``.
         """
         if self.num_gpu_blocks < 2:
@@ -60,29 +77,44 @@ class PDBlockPoolConfig:
         usable_start = 1 if self.reserve_null_block else 0
         usable = self.num_gpu_blocks - usable_start
 
+        num_swa = int(self.num_swa_blocks)
+        if num_swa <= 0:
+            raise ValueError("SWA region must be > 0")
+        if num_swa >= usable:
+            raise ValueError(
+                f"SWA region ({num_swa}) leaves no blocks for prefill/decode "
+                f"(usable={usable}, num_gpu_blocks={self.num_gpu_blocks})"
+            )
+
         if self.num_decode_blocks is not None:
             num_decode = int(self.num_decode_blocks)
         else:
             num_decode = int(self.max_num_decode_reqs) * int(self.max_blocks_per_decode_req)
         if num_decode <= 0:
             raise ValueError("decode region must be > 0")
-        if num_decode >= usable:
+
+        remaining = usable - num_swa
+        if num_decode >= remaining:
             raise ValueError(
-                f"decode region ({num_decode}) leaves no prefill blocks "
-                f"(usable={usable}, num_gpu_blocks={self.num_gpu_blocks})"
+                f"decode region ({num_decode}) leaves no non-SWA prefill blocks "
+                f"(remaining_after_swa={remaining}, swa={num_swa}, "
+                f"num_gpu_blocks={self.num_gpu_blocks})"
             )
-        prefill_start = usable_start
-        prefill_end = usable_start + (usable - num_decode)
+
+        swa_start = usable_start
+        swa_end = usable_start + num_swa
+        prefill_end = swa_end + (remaining - num_decode)
         decode_end = self.num_gpu_blocks
-        return null_id, prefill_start, prefill_end, decode_end
+        return null_id, swa_start, swa_end, prefill_end, decode_end
 
 
 class _PrefillBumpRegion:
     """Contiguous bump allocator over ``[start, end)`` with wrap-around search."""
 
-    def __init__(self, start: int, end: int) -> None:
+    def __init__(self, start: int, end: int, name: str = "prefill") -> None:
         if end <= start:
-            raise ValueError(f"empty prefill region [{start}, {end})")
+            raise ValueError(f"empty {name} region [{start}, {end})")
+        self.name = name
         self.start = start
         self.end = end
         self.capacity = end - start
@@ -107,7 +139,7 @@ class _PrefillBumpRegion:
         if n <= 0:
             return []
         if n > self._num_free:
-            raise ValueError(f"prefill region: need {n} free blocks, only {self._num_free} left")
+            raise ValueError(f"{self.name} region: need {n} free blocks, only {self._num_free} left")
 
         # Fast path: one contiguous span.
         span = self._find_contiguous_span(n)
@@ -121,7 +153,7 @@ class _PrefillBumpRegion:
             first, length = self._find_largest_contiguous_span(remaining)
             if length <= 0 or first is None:
                 raise ValueError(
-                    f"prefill region: need {n} blocks, allocated {n - remaining}, "
+                    f"{self.name} region: need {n} blocks, allocated {n - remaining}, "
                     f"free={self._num_free} but no free contiguous span left (fragmented)"
                 )
             out.extend(self._take_span(first, length))
@@ -132,7 +164,7 @@ class _PrefillBumpRegion:
     def free(self, block_ids: list[int]) -> None:
         for bid in block_ids:
             if not (self.start <= bid < self.end):
-                raise ValueError(f"block {bid} not in prefill region [{self.start}, {self.end})")
+                raise ValueError(f"block {bid} not in {self.name} region [{self.start}, {self.end})")
             self._mark_free(bid)
 
     def _take_span(self, first: int, n: int) -> list[int]:
@@ -188,7 +220,7 @@ class _PrefillBumpRegion:
     def _mark_used(self, bid: int) -> None:
         idx = bid - self.start
         if not self._free[idx]:
-            raise RuntimeError(f"prefill block {bid} already allocated")
+            raise RuntimeError(f"{self.name} block {bid} already allocated")
         self._free[idx] = False
         self._num_free -= 1
 
@@ -229,12 +261,11 @@ class _DecodeFreeListRegion:
 
 
 class PDBlockPool(BlockPool):
-    """BlockPool that allocates from partitioned prefill/decode regions.
+    """BlockPool with SWA + prefill/decode partitioned regions.
 
-    Call :meth:`set_alloc_is_prefill` before ``get_new_blocks`` /
-    ``get_num_free_blocks`` so admission and allocation use the correct region.
-    Free always routes by block-id range (prefill blocks stay in prefill even
-    after the request enters decode).
+    Call :meth:`set_alloc_is_prefill` / :meth:`set_alloc_is_swa` before
+    ``get_new_blocks`` / ``get_num_free_blocks`` so admission and allocation
+    use the correct region. Free always routes by block-id range.
     """
 
     def __init__(
@@ -266,7 +297,7 @@ class PDBlockPool(BlockPool):
                 f"num_gpu_blocks ({num_gpu_blocks})"
             )
         self.pd_config = pd_config
-        null_id, prefill_start, prefill_end, decode_end = pd_config.resolve()
+        null_id, swa_start, swa_end, prefill_end, decode_end = pd_config.resolve()
         if null_id != 0 or self.null_block.block_id != 0:
             raise ValueError("PDBlockPool expects null block id 0")
 
@@ -276,21 +307,32 @@ class PDBlockPool(BlockPool):
             self.free_block_queue.popleft_n(n_free)
         assert self.free_block_queue.num_free_blocks == 0
 
-        self.prefill = _PrefillBumpRegion(prefill_start, prefill_end)
+        self.swa = _PrefillBumpRegion(swa_start, swa_end, name="swa")
+        self.prefill = _PrefillBumpRegion(swa_end, prefill_end, name="prefill")
         self.decode = _DecodeFreeListRegion(prefill_end, decode_end)
         # None = unset (treat as total free for get_num_free_blocks).
         self._alloc_is_prefill: bool | None = None
+        self._alloc_is_swa: bool | None = None
+        # Set by coordinator.get_num_blocks_to_allocate for split admission.
+        self._pending_swa_blocks: int | None = None
 
         logger.info(
-            "PDBlockPool enabled: prefill=[%d,%d) (%d blocks), "
-            "decode=[%d,%d) (%d blocks)",
-            prefill_start,
+            "PDBlockPool enabled: swa=[%d,%d) (%d blocks), "
+            "prefill=[%d,%d) (%d blocks), decode=[%d,%d) (%d blocks)",
+            swa_start,
+            swa_end,
+            swa_end - swa_start,
+            swa_end,
             prefill_end,
-            prefill_end - prefill_start,
+            prefill_end - swa_end,
             prefill_end,
             decode_end,
             decode_end - prefill_end,
         )
+
+    @property
+    def swa_range(self) -> tuple[int, int]:
+        return self.swa.start, self.swa.end
 
     @property
     def prefill_range(self) -> tuple[int, int]:
@@ -305,17 +347,43 @@ class PDBlockPool(BlockPool):
 
     def clear_alloc_is_prefill(self) -> None:
         self._alloc_is_prefill = None
+        self._pending_swa_blocks = None
+
+    def set_alloc_is_swa(self, is_swa: bool) -> None:
+        self._alloc_is_swa = is_swa
+
+    def clear_alloc_is_swa(self) -> None:
+        self._alloc_is_swa = None
+
+    def set_pending_swa_blocks(self, num_swa_blocks: int) -> None:
+        """Record SWA need for the next ``get_num_free_blocks`` admission check."""
+        self._pending_swa_blocks = int(num_swa_blocks)
+
+    def clear_pending_swa_blocks(self) -> None:
+        self._pending_swa_blocks = None
 
     def get_num_free_blocks(self) -> int:
-        if self._alloc_is_prefill is True:
-            return self.prefill.num_free
+        # Decode: all groups share the decode free-list (no SWA split).
         if self._alloc_is_prefill is False:
             return self.decode.num_free
-        return self.prefill.num_free + self.decode.num_free
+
+        # Prefill split admission: coordinator returns only non-SWA need;
+        # fail if SWA cannot be satisfied, otherwise report prefill free.
+        if self._pending_swa_blocks is not None:
+            if self._pending_swa_blocks > self.swa.num_free:
+                return -1
+            return self.prefill.num_free
+
+        if self._alloc_is_swa is True:
+            return self.swa.num_free
+        if self._alloc_is_prefill is True:
+            return self.prefill.num_free
+        return self.swa.num_free + self.prefill.num_free + self.decode.num_free
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         if num_blocks <= 0:
             return []
+
         is_prefill = self._alloc_is_prefill
         if is_prefill is None:
             # Fallback heuristic if caller forgot to set the flag.
@@ -327,18 +395,32 @@ class PDBlockPool(BlockPool):
                 num_blocks,
             )
 
-        region_free = self.prefill.num_free if is_prefill else self.decode.num_free
-        if num_blocks > region_free:
-            raise ValueError(
-                f"Cannot get {num_blocks} free blocks from the "
-                f"{'prefill' if is_prefill else 'decode'} PD region "
-                f"(free={region_free})"
-            )
-
-        if is_prefill:
-            ids = self.prefill.allocate_contiguous(num_blocks)
-        else:
+        # Decode phase: all groups (including SWA) use the decode free-list
+        # so incremental decode pops do not punch holes in the SWA bump region.
+        if not is_prefill:
+            region_free = self.decode.num_free
+            if num_blocks > region_free:
+                raise ValueError(
+                    f"Cannot get {num_blocks} free blocks from the decode PD region "
+                    f"(free={region_free})"
+                )
             ids = self.decode.allocate(num_blocks)
+        elif self._alloc_is_swa is True:
+            region_free = self.swa.num_free
+            if num_blocks > region_free:
+                raise ValueError(
+                    f"Cannot get {num_blocks} free blocks from the swa PD region "
+                    f"(free={region_free})"
+                )
+            ids = self.swa.allocate_contiguous(num_blocks)
+        else:
+            region_free = self.prefill.num_free
+            if num_blocks > region_free:
+                raise ValueError(
+                    f"Cannot get {num_blocks} free blocks from the prefill PD region "
+                    f"(free={region_free})"
+                )
+            ids = self.prefill.allocate_contiguous(num_blocks)
 
         ret = [self.blocks[bid] for bid in ids]
         for block in ret:
@@ -356,26 +438,33 @@ class PDBlockPool(BlockPool):
             if block.ref_cnt == 0 and not block.is_null:
                 to_free.append(block)
 
+        swa_ids: list[int] = []
         prefill_ids: list[int] = []
         decode_ids: list[int] = []
         for block in to_free:
             bid = block.block_id
-            if self.prefill.start <= bid < self.prefill.end:
+            if self.swa.start <= bid < self.swa.end:
+                swa_ids.append(bid)
+            elif self.prefill.start <= bid < self.prefill.end:
                 prefill_ids.append(bid)
             elif self.decode.start <= bid < self.decode.end:
                 decode_ids.append(bid)
             else:
                 raise ValueError(f"block {bid} outside PD regions {self.summary()}")
+        if swa_ids:
+            self.swa.free(swa_ids)
         if prefill_ids:
             self.prefill.free(prefill_ids)
         if decode_ids:
             self.decode.free(decode_ids)
 
     def summary(self) -> str:
+        ss, se = self.swa_range
         ps, pe = self.prefill_range
         ds, de = self.decode_range
         return (
             f"PDBlockPool(null=0, "
+            f"swa=[{ss},{se}) free={self.swa.num_free}/{self.swa.capacity}, "
             f"prefill=[{ps},{pe}) free={self.prefill.num_free}/{self.prefill.capacity}, "
             f"decode=[{ds},{de}) free={self.decode.num_free})"
         )
@@ -383,10 +472,12 @@ class PDBlockPool(BlockPool):
 
 def demo_pd_partition() -> None:
     """Tiny smoke demo: ``python -m vllm_ascend.core.pd_block_pool``."""
+    # Need room for SWA(2048) + prefill + decode; use a large pool for the demo.
     cfg = PDBlockPoolConfig(
-        num_gpu_blocks=128,
+        num_gpu_blocks=4096,
         max_num_decode_reqs=32,
         max_blocks_per_decode_req=2,  # decode region = 64
+        num_swa_blocks=SWA_KV_BLOCK_REGION_SIZE,
     )
     pool = PDBlockPool(
         num_gpu_blocks=cfg.num_gpu_blocks,
@@ -396,23 +487,35 @@ def demo_pd_partition() -> None:
     )
     print(pool.summary())
 
+    pool.set_alloc_is_swa(True)
+    s0 = pool.get_new_blocks(8)
+    print("swa alloc", [b.block_id for b in s0], "range", pool.swa_range)
+
+    pool.clear_alloc_is_swa()
     pool.set_alloc_is_prefill(True)
     p0 = pool.get_new_blocks(8)
-    print("prefill alloc", [b.block_id for b in p0])
+    print("prefill alloc", [b.block_id for b in p0], "range", pool.prefill_range)
 
     pool.set_alloc_is_prefill(False)
     d_blocks = [pool.get_new_blocks(1)[0] for _ in range(32)]
     print("decode alloc head/tail", d_blocks[0].block_id, d_blocks[-1].block_id, pool.decode_range)
 
+    pool.free_blocks(s0)
     pool.free_blocks(p0)
+    pool.set_alloc_is_swa(True)
+    s1 = pool.get_new_blocks(8)
+    print("swa realloc after free", [b.block_id for b in s1])
+    pool.clear_alloc_is_swa()
     pool.set_alloc_is_prefill(True)
     p1 = pool.get_new_blocks(8)
     print("prefill realloc after free", [b.block_id for b in p1])
     print(pool.summary())
 
+    pool.free_blocks(s1)
+    pool.free_blocks(p1)
     pool.free_blocks(d_blocks)
     pool.clear_alloc_is_prefill()
-    print("after decode free", pool.summary())
+    print("after free", pool.summary())
 
 
 if __name__ == "__main__":
