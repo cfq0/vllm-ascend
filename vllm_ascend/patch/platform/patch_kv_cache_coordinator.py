@@ -538,7 +538,18 @@ def _allocate_slots_with_pd_region(self: KVCacheManager, request, *args, **kwarg
     is_prefill = request.num_computed_tokens < request.num_prompt_tokens
     pool.set_alloc_is_prefill(is_prefill)
     try:
-        return _original_allocate_slots(self, request, *args, **kwargs)
+        result = _original_allocate_slots(self, request, *args, **kwargs)
+        if result is None:
+            print(
+                f"[PDBlockPool] allocate_slots returned None "
+                f"req={request.request_id} is_prefill={is_prefill} "
+                f"computed={request.num_computed_tokens} "
+                f"prompt={request.num_prompt_tokens} "
+                f"pending_swa={pool._pending_swa_blocks} "
+                f"| {pool.summary()}",
+                flush=True,
+            )
+        return result
     finally:
         pool.clear_alloc_is_swa()
         pool.clear_pending_swa_blocks()

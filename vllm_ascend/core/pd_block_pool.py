@@ -371,6 +371,11 @@ class PDBlockPool(BlockPool):
         # fail if SWA cannot be satisfied, otherwise report prefill free.
         if self._pending_swa_blocks is not None:
             if self._pending_swa_blocks > self.swa.num_free:
+                print(
+                    f"[PDBlockPool] admission reject: SWA need={self._pending_swa_blocks} "
+                    f"> swa.free={self.swa.num_free} | {self.summary()}",
+                    flush=True,
+                )
                 return -1
             return self.prefill.num_free
 
@@ -398,29 +403,66 @@ class PDBlockPool(BlockPool):
         # Decode phase: all groups (including SWA) use the decode free-list
         # so incremental decode pops do not punch holes in the SWA bump region.
         if not is_prefill:
+            region = "decode"
             region_free = self.decode.num_free
             if num_blocks > region_free:
+                print(
+                    f"[PDBlockPool] alloc fail: need={num_blocks} region={region} "
+                    f"free={region_free} is_prefill={is_prefill} is_swa={self._alloc_is_swa} "
+                    f"| {self.summary()}",
+                    flush=True,
+                )
                 raise ValueError(
                     f"Cannot get {num_blocks} free blocks from the decode PD region "
                     f"(free={region_free})"
                 )
             ids = self.decode.allocate(num_blocks)
         elif self._alloc_is_swa is True:
+            region = "swa"
             region_free = self.swa.num_free
             if num_blocks > region_free:
+                print(
+                    f"[PDBlockPool] alloc fail: need={num_blocks} region={region} "
+                    f"free={region_free} is_prefill={is_prefill} is_swa={self._alloc_is_swa} "
+                    f"| {self.summary()}",
+                    flush=True,
+                )
                 raise ValueError(
                     f"Cannot get {num_blocks} free blocks from the swa PD region "
                     f"(free={region_free})"
                 )
-            ids = self.swa.allocate_contiguous(num_blocks)
+            try:
+                ids = self.swa.allocate_contiguous(num_blocks)
+            except ValueError as e:
+                print(
+                    f"[PDBlockPool] alloc fail (contiguous): need={num_blocks} region=swa "
+                    f"free={self.swa.num_free} err={e} | {self.summary()}",
+                    flush=True,
+                )
+                raise
         else:
+            region = "prefill"
             region_free = self.prefill.num_free
             if num_blocks > region_free:
+                print(
+                    f"[PDBlockPool] alloc fail: need={num_blocks} region={region} "
+                    f"free={region_free} is_prefill={is_prefill} is_swa={self._alloc_is_swa} "
+                    f"| {self.summary()}",
+                    flush=True,
+                )
                 raise ValueError(
                     f"Cannot get {num_blocks} free blocks from the prefill PD region "
                     f"(free={region_free})"
                 )
-            ids = self.prefill.allocate_contiguous(num_blocks)
+            try:
+                ids = self.prefill.allocate_contiguous(num_blocks)
+            except ValueError as e:
+                print(
+                    f"[PDBlockPool] alloc fail (contiguous): need={num_blocks} region=prefill "
+                    f"free={self.prefill.num_free} err={e} | {self.summary()}",
+                    flush=True,
+                )
+                raise
 
         ret = [self.blocks[bid] for bid in ids]
         for block in ret:
