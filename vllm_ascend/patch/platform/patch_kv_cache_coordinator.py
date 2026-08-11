@@ -23,7 +23,9 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
     SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend import envs
@@ -33,6 +35,7 @@ from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cac
 USE_MULTI_GROUPS_KV_CACHE = True
 # Real SWA KV block_size; keep in sync with dsa_cp.SWA_KV_BLOCK_SIZE.
 _SWA_KV_BLOCK_SIZE = 128
+_C4_COMPRESS_RATIO = 4
 
 try:
     from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
@@ -48,6 +51,38 @@ def _is_swa_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
     """
     spec = manager.kv_cache_spec
     return isinstance(spec, SlidingWindowMLASpec) and int(spec.block_size) == _SWA_KV_BLOCK_SIZE
+
+
+def _is_c4_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
+    """True for DeepSeek V4 C4 MLA group (compress KV + indexer, ratio==4)."""
+    spec = manager.kv_cache_spec
+    if isinstance(spec, MLAAttentionSpec):
+        return int(getattr(spec, "compress_ratio", 1)) == _C4_COMPRESS_RATIO
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        inner = list(spec.kv_cache_specs.values())
+        if not inner:
+            return False
+        return all(
+            isinstance(s, MLAAttentionSpec) and int(getattr(s, "compress_ratio", 1)) == _C4_COMPRESS_RATIO
+            for s in inner
+        )
+    return False
+
+
+def _set_pd_alloc_region(pool: PDBlockPool, manager: SingleTypeKVCacheManager, use_prefill_regions: bool) -> None:
+    """Route one manager alloc to SWA / C4 / other-prefill bump (prefill only)."""
+    if not use_prefill_regions:
+        pool.clear_alloc_is_swa()
+        pool.clear_alloc_is_c4()
+        return
+    if _is_swa_kv_manager(manager):
+        pool.set_alloc_is_swa(True)
+        return
+    if _is_c4_kv_manager(manager):
+        pool.set_alloc_is_c4(True)
+        return
+    pool.clear_alloc_is_swa()
+    pool.clear_alloc_is_c4()
 
 
 def _build_block_pool(
@@ -208,10 +243,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         num_tokens_main_model: int | None = None,
         apply_admission_cap: bool = False,
     ) -> int:
-        """Prefill: non-SWA need (+ stash SWA). Decode: total need vs decode region."""
+        """Prefill: other-prefill need (+ stash SWA/C4). Decode: total vs decode region."""
         if num_tokens_main_model is None:
             num_tokens_main_model = num_tokens
         swa_need = 0
+        c4_need = 0
         other_need = 0
         for i, manager in enumerate(self.single_type_managers):
             if CrossAttentionManager is not None and isinstance(manager, CrossAttentionManager):
@@ -238,6 +274,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 )
             if _is_swa_kv_manager(manager):
                 swa_need += n
+            elif _is_c4_kv_manager(manager):
+                c4_need += n
             else:
                 other_need += n
 
@@ -246,11 +284,13 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # Decode: every group draws from the decode free-list.
             if pool._alloc_is_prefill is False:
                 pool.clear_pending_swa_blocks()
-                return swa_need + other_need
-            # Prefill: split SWA bump vs non-SWA prefill bump.
+                pool.clear_pending_c4_blocks()
+                return swa_need + c4_need + other_need
+            # Prefill: split SWA / C4 bumps vs remaining prefill bump.
             pool.set_pending_swa_blocks(swa_need)
+            pool.set_pending_c4_blocks(c4_need)
             return other_need
-        return swa_need + other_need
+        return swa_need + c4_need + other_need
 
     def allocate_new_computed_blocks(
         self,
@@ -272,14 +312,14 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             assert all(len(blocks) == 0 for blocks in new_computed_blocks)
             return
 
-        # SWA region is prefill-only; decode ignores is_swa and uses decode region.
-        use_swa_region = pool._alloc_is_prefill is True
+        # Prefill-only bump regions; decode ignores SWA/C4 flags and uses decode region.
+        use_prefill_regions = pool._alloc_is_prefill is True
         try:
             managers = self.single_type_managers
             # Prefer upstream two-phase API when present.
             if hasattr(managers[0], "add_local_computed_blocks"):
                 for i, manager in enumerate(managers):
-                    pool.set_alloc_is_swa(use_swa_region and _is_swa_kv_manager(manager))
+                    _set_pd_alloc_region(pool, manager, use_prefill_regions)
                     manager.add_local_computed_blocks(
                         request_id,
                         new_computed_blocks[i],
@@ -288,7 +328,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     )
                 if num_external_computed_tokens > 0:
                     for manager in managers:
-                        pool.set_alloc_is_swa(use_swa_region and _is_swa_kv_manager(manager))
+                        _set_pd_alloc_region(pool, manager, use_prefill_regions)
                         manager.allocate_external_computed_blocks(
                             request_id,
                             num_local_computed_tokens,
@@ -296,7 +336,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         )
             else:
                 for i, manager in enumerate(managers):
-                    pool.set_alloc_is_swa(use_swa_region and _is_swa_kv_manager(manager))
+                    _set_pd_alloc_region(pool, manager, use_prefill_regions)
                     manager.allocate_new_computed_blocks(
                         request_id,
                         new_computed_blocks[i],
@@ -305,6 +345,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     )
         finally:
             pool.clear_alloc_is_swa()
+            pool.clear_alloc_is_c4()
 
     def allocate_new_blocks(
         self,
@@ -322,12 +363,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 num_encoder_tokens,
             )
 
-        # SWA region is prefill-only; decode ignores is_swa and uses decode region.
-        use_swa_region = pool._alloc_is_prefill is True
+        # Prefill-only bump regions; decode ignores SWA/C4 flags and uses decode region.
+        use_prefill_regions = pool._alloc_is_prefill is True
         results: list[list[KVCacheBlock]] = []
         try:
             for manager in self.single_type_managers:
-                pool.set_alloc_is_swa(use_swa_region and _is_swa_kv_manager(manager))
+                _set_pd_alloc_region(pool, manager, use_prefill_regions)
                 tokens = (
                     num_encoder_tokens
                     if CrossAttentionManager is not None and isinstance(manager, CrossAttentionManager)
@@ -336,6 +377,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 results.append(manager.allocate_new_blocks(request_id, tokens, num_tokens_main_model))
         finally:
             pool.clear_alloc_is_swa()
+            pool.clear_alloc_is_c4()
         return tuple(results)
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -538,21 +580,12 @@ def _allocate_slots_with_pd_region(self: KVCacheManager, request, *args, **kwarg
     is_prefill = request.num_computed_tokens < request.num_prompt_tokens
     pool.set_alloc_is_prefill(is_prefill)
     try:
-        result = _original_allocate_slots(self, request, *args, **kwargs)
-        if result is None:
-            print(
-                f"[PDBlockPool] allocate_slots returned None "
-                f"req={request.request_id} is_prefill={is_prefill} "
-                f"computed={request.num_computed_tokens} "
-                f"prompt={request.num_prompt_tokens} "
-                f"pending_swa={pool._pending_swa_blocks} "
-                f"| {pool.summary()}",
-                flush=True,
-            )
-        return result
+        return _original_allocate_slots(self, request, *args, **kwargs)
     finally:
         pool.clear_alloc_is_swa()
+        pool.clear_alloc_is_c4()
         pool.clear_pending_swa_blocks()
+        pool.clear_pending_c4_blocks()
         pool.clear_alloc_is_prefill()
 
 

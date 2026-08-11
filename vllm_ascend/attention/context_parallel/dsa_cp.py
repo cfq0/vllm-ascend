@@ -36,11 +36,43 @@ ContiguousSlotRun = tuple[int, int, int]
 # Prefill: shorter runs go to scatter. Decode never uses copy_runs.
 # A copy_ run must cover at least MIN_CONTIGUOUS_BLOCKS consecutive block_ids.
 MIN_CONTIGUOUS_BLOCKS = 2
-# Real SWA uses block_size=128; C4/C128 state caches use 8/32 and must be skipped.
+# Real SWA / C4 MLA(+indexer) use block_size=128; state caches use 8/32 and must be skipped.
 SWA_KV_BLOCK_SIZE = 128
+C4_COMPRESS_RATIO = 4
 
 
-def plan_swa_kv_slot_writes(
+def _build_compressed_query_start_loc(
+    input_positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Map original-token ``query_start_loc`` into compressed-token bounds."""
+    if compress_ratio <= 1 or num_reqs <= 0:
+        qsl = query_start_loc.detach()
+        return qsl.cpu() if qsl.device.type != "cpu" else qsl
+
+    pos = input_positions.detach()
+    if pos.device.type != "cpu":
+        pos = pos.cpu()
+    qsl = query_start_loc.detach()
+    if qsl.device.type != "cpu":
+        qsl = qsl.cpu()
+    bounds = qsl[: num_reqs + 1].tolist()
+    out = [0]
+    for req_idx in range(num_reqs):
+        begin = int(bounds[req_idx])
+        end = int(bounds[req_idx + 1])
+        if end <= begin:
+            out.append(out[-1])
+            continue
+        seg = pos[begin:end]
+        n_cmp = int(((seg + 1) % compress_ratio == 0).sum().item())
+        out.append(out[-1] + n_cmp)
+    return torch.tensor(out, dtype=torch.int64, device="cpu")
+
+
+def plan_kv_slot_writes(
     slot_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_reqs: int,
@@ -49,7 +81,9 @@ def plan_swa_kv_slot_writes(
     device: torch.device | None = None,
     block_size: int = 128,
 ) -> tuple[list[ContiguousSlotRun], torch.Tensor]:
-    """Plan SWA KV writes: consecutive-block prefill ``copy_`` runs + scatter.
+    """Plan KV writes: consecutive-block prefill ``copy_`` runs + scatter.
+
+    Used by real SWA and C4 MLA (+ indexer) caches.
 
     - Decode (``req_idx < num_decodes``): all valid tokens → scatter.
     - Prefill: tokens whose block_ids are consecutive (>= MIN_CONTIGUOUS_BLOCKS)
@@ -129,18 +163,16 @@ def plan_swa_kv_slot_writes(
             num_blocks = end_block - start_block + 1
             if num_blocks >= MIN_CONTIGUOUS_BLOCKS:
                 copy_runs.append((tok_start, run_len, slot_start))
-                print(
-                    f"[KVSlotPlan] copy_run token_start={tok_start} "
-                    f"run_len={run_len} slot_start={slot_start} "
-                    f"block_ids=[{start_block}..{end_block}] num_blocks={num_blocks}",
-                    flush=True,
-                )
             else:
                 scatter_idxs.extend(range(tok_start, tok_start + run_len))
 
     if not scatter_idxs:
         return copy_runs, empty_scatter
     return copy_runs, torch.tensor(scatter_idxs, dtype=torch.int32, device=device)
+
+
+# Backward-compatible alias (SWA was the first caller).
+plan_swa_kv_slot_writes = plan_kv_slot_writes
 
 
 if HAS_TRITON:
@@ -216,7 +248,7 @@ class AscendDSAReqMetadata:
     qli_metadata: torch.Tensor = None
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
-    # Builder-time SWA KV write plan (see plan_swa_kv_slot_writes):
+    # Builder-time KV write plan (see plan_kv_slot_writes): SWA + C4 MLA/indexer.
     # - contiguous_slot_runs: consecutive-slot prefill copy_ (may span blocks)
     # - scatter_token_indices: decode + short prefill fragments
     contiguous_slot_runs: list[ContiguousSlotRun] | None = None
@@ -439,21 +471,35 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             [slot_mapping // self.block_size, slot_mapping % self.block_size], dim=-1
         )
 
-        # Only real SWA KV (block_size=128). Skip C4/C128 state caches (8/32).
+        # Real SWA (ratio<=1) and C4 MLA/indexer (ratio==4): block_size=128.
+        # Skip state caches (SlidingWindowMLA, block_size 8/32).
         # Decode → scatter; prefill → consecutive-slot copy_ (may span blocks).
         contiguous_slot_runs: list[ContiguousSlotRun] | None = None
         scatter_token_indices: torch.Tensor | None = None
         plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
-        if self.compressor_ratio <= 1 and plan_block_size == SWA_KV_BLOCK_SIZE:
-            n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
-            if self.num_actual_tokens is not None:
-                n_slots = min(n_slots, int(self.num_actual_tokens))
+        plan_c4 = self.compressor_ratio == C4_COMPRESS_RATIO
+        plan_swa = self.compressor_ratio <= 1
+        if plan_block_size == SWA_KV_BLOCK_SIZE and (plan_swa or plan_c4):
             qsl = (
                 common_attn_metadata.query_start_loc_cpu
                 if common_attn_metadata.query_start_loc_cpu is not None
                 else common_attn_metadata.query_start_loc
             )
-            contiguous_slot_runs, scatter_token_indices = plan_swa_kv_slot_writes(
+            if plan_c4:
+                # C4 slot_mapping is compressed-token length; qsl is original-token.
+                n_slots = int(self._get_slot_mapping_size(input_positions_cpu, self.compressor_ratio))
+                n_slots = min(n_slots, int(slot_mapping.shape[0]))
+                qsl = _build_compressed_query_start_loc(
+                    input_positions_cpu,
+                    qsl,
+                    num_reqs=num_reqs,
+                    compress_ratio=self.compressor_ratio,
+                )
+            else:
+                n_slots = min(int(slot_mapping.shape[0]), int(num_input_tokens))
+                if self.num_actual_tokens is not None:
+                    n_slots = min(n_slots, int(self.num_actual_tokens))
+            contiguous_slot_runs, scatter_token_indices = plan_kv_slot_writes(
                 slot_mapping[:n_slots],
                 query_start_loc=qsl,
                 num_reqs=num_reqs,
@@ -1189,19 +1235,30 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         return output
 
-    def _write_swa_kv_cache(
+    def _write_kv_cache_by_plan(
         self,
-        swa_kv_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
         kv: torch.Tensor,
-        swa_slot: torch.Tensor,
+        slot_mapping: torch.Tensor,
         contiguous_slot_runs: list[ContiguousSlotRun] | None,
         scatter_token_indices: torch.Tensor | None,
     ) -> None:
-        """Write SWA KV: consecutive-slot ``copy_`` runs (may span blocks), then scatter."""
+        """Write KV cache: consecutive-slot ``copy_`` runs, then scatter.
+
+        Used by SWA and C4 MLA (+ indexer). If no plan was built, fall back to
+        full scatter (legacy path).
+        """
+        if kv is None or kv.numel() == 0:
+            return
+
+        if contiguous_slot_runs is None and scatter_token_indices is None:
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(kv_cache, slot_mapping, kv)
+            return
+
         if contiguous_slot_runs:
             num_tokens = kv.shape[0]
             kv_flat = kv.reshape(num_tokens, -1)
-            cache_flat = swa_kv_cache.reshape(-1, kv_flat.shape[-1])
+            cache_flat = kv_cache.reshape(-1, kv_flat.shape[-1])
             for token_start, length, slot_start in contiguous_slot_runs:
                 token_start = int(token_start)
                 length = int(length)
@@ -1214,9 +1271,26 @@ class AscendDSACPImpl(DSAAttentionImpl):
             return
         idx = scatter_token_indices.long()
         torch.ops._C_ascend.npu_scatter_nd_update_v2(
-            swa_kv_cache,
-            swa_slot[idx].contiguous(),
+            kv_cache,
+            slot_mapping[idx].contiguous(),
             kv[idx].contiguous(),
+        )
+
+    def _write_swa_kv_cache(
+        self,
+        swa_kv_cache: torch.Tensor,
+        kv: torch.Tensor,
+        swa_slot: torch.Tensor,
+        contiguous_slot_runs: list[ContiguousSlotRun] | None,
+        scatter_token_indices: torch.Tensor | None,
+    ) -> None:
+        """Backward-compatible wrapper around :meth:`_write_kv_cache_by_plan`."""
+        self._write_kv_cache_by_plan(
+            swa_kv_cache,
+            kv,
+            swa_slot,
+            contiguous_slot_runs,
+            scatter_token_indices,
         )
 
     def _forward(
@@ -1396,9 +1470,15 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
             if compressed_kv.numel() == 0:
                 compressed_kv = None
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                compress_kv_cache, compressor_attn_metadata.req_metadata.slot_mapping, compressed_kv
-            )
+            else:
+                # C4: same copy_/scatter plan as SWA (builder fills runs on ratio==4).
+                self._write_kv_cache_by_plan(
+                    compress_kv_cache,
+                    compressed_kv,
+                    compressor_attn_metadata.req_metadata.slot_mapping,
+                    compressor_attn_metadata.req_metadata.contiguous_slot_runs,
+                    compressor_attn_metadata.req_metadata.scatter_token_indices,
+                )
 
         common_attn_kwargs = dict(
             cu_seqlens_q=local_seq_lengths_query,
@@ -1533,12 +1613,12 @@ class AscendDSACPImpl(DSAAttentionImpl):
         if soc_version not in {AscendDeviceType.A5}:
             kv_scale = kv_scale.to(torch.float16).unsqueeze(-1)
 
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(
-            indexer_k_cache, indexer_kv_scale_metadata.req_metadata.slot_mapping, kv
-        )
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(
-            indexer_scale_cache, indexer_kv_scale_metadata.req_metadata.slot_mapping, kv_scale
-        )
+        # Indexer shares C4 MLA group; reuse builder copy_/scatter plan.
+        idx_slot = indexer_kv_scale_metadata.req_metadata.slot_mapping
+        idx_runs = indexer_kv_scale_metadata.req_metadata.contiguous_slot_runs
+        idx_scatter = indexer_kv_scale_metadata.req_metadata.scatter_token_indices
+        self._write_kv_cache_by_plan(indexer_k_cache, kv, idx_slot, idx_runs, idx_scatter)
+        self._write_kv_cache_by_plan(indexer_scale_cache, kv_scale, idx_slot, idx_runs, idx_scatter)
 
     def _indexer_select_topk(
         self,
