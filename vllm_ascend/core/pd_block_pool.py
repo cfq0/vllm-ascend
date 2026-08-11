@@ -67,9 +67,9 @@ class PDBlockPoolConfig:
     num_decode_blocks: int | None = None
     # Keep a null block at id 0.
     reserve_null_block: bool = True
-    # Target SWA id region size (real SWA block_size=128). May shrink to fit.
+    # Fixed SWA id region size (real SWA block_size=128).
     num_swa_blocks: int = SWA_KV_BLOCK_REGION_SIZE
-    # Target C4 (+ indexer) id region size. Shrinks before SWA if needed.
+    # Fixed C4 (+ indexer) id region size.
     num_c4_blocks: int = C4_KV_BLOCK_REGION_SIZE
 
     def resolve(self) -> tuple[int, int, int, int, int, int]:
@@ -80,9 +80,10 @@ class PDBlockPoolConfig:
         Other prefill owns ``[c4_end, prefill_end)``.
         Decode owns ``[prefill_end, decode_end)``.
 
-        Prefers keeping SWA/C4 at their targets. The leftover after SWA+C4 is
-        split so decode never exceeds half of that leftover (decode and
-        other-prefill share the tail; decode is capped by the requested size).
+        SWA/C4 keep their configured sizes. The leftover after SWA+C4 is split
+        so decode never exceeds half of that leftover (decode and other-prefill
+        share the tail; decode is also capped by the requested size). If the
+        leftover is too small to give both regions at least one block, raise.
         """
         if self.num_gpu_blocks < 2:
             raise ValueError("num_gpu_blocks must be >= 2")
@@ -104,49 +105,36 @@ class PDBlockPoolConfig:
         if req_decode <= 0:
             raise ValueError("decode region must be > 0")
 
-        req_swa, req_c4 = num_swa, num_c4
-
-        # Need at least 1 other-prefill + 1 decode after SWA/C4.
+        # Need at least 1 other-prefill + 1 decode after fixed SWA/C4.
         min_tail = _MIN_OTHER_PREFILL_BLOCKS + 1
-        if usable < min_tail + 2:
+        if num_swa + num_c4 + min_tail > usable:
             raise ValueError(
-                f"num_gpu_blocks={self.num_gpu_blocks} too small for PD regions "
-                f"(usable={usable})"
+                f"SWA+C4 regions ({num_swa}+{num_c4}) leave no room to split "
+                f"decode/other-prefill (need>={min_tail} leftover, usable={usable}, "
+                f"num_gpu_blocks={self.num_gpu_blocks})"
             )
-
-        # Prefer full SWA/C4; shrink C4 first, then SWA, only if needed.
-        swa_c4_budget = usable - min_tail
-        if num_swa + num_c4 > swa_c4_budget:
-            if num_swa >= swa_c4_budget:
-                num_swa = max(1, swa_c4_budget // 2)
-                num_c4 = max(1, swa_c4_budget - num_swa)
-            else:
-                num_c4 = max(1, swa_c4_budget - num_swa)
 
         tail = usable - num_swa - num_c4
         # Decode and other-prefill split the tail: decode <= half(tail), and
         # also <= requested decode size. Remainder goes to other-prefill.
         num_decode = min(req_decode, max(1, tail // 2))
         other_prefill = tail - num_decode
-        if other_prefill < _MIN_OTHER_PREFILL_BLOCKS:
+        if num_decode < 1 or other_prefill < _MIN_OTHER_PREFILL_BLOCKS:
             raise ValueError(
-                f"decode/other tail too small after SWA/C4 "
-                f"(tail={tail}, swa={num_swa}, c4={num_c4}, "
-                f"num_gpu_blocks={self.num_gpu_blocks})"
+                f"Cannot split decode/other-prefill from leftover after SWA/C4 "
+                f"(tail={tail}, decode={num_decode}, other={other_prefill}, "
+                f"swa={num_swa}, c4={num_c4}, num_gpu_blocks={self.num_gpu_blocks})"
             )
 
-        if (num_swa, num_c4, num_decode) != (req_swa, req_c4, req_decode):
+        if num_decode != req_decode:
             logger.warning(
-                "PDBlockPool adjusting regions to fit pool: "
-                "swa %d→%d, c4 %d→%d, decode %d→%d, other=%d "
-                "(usable=%d, num_gpu_blocks=%d)",
-                req_swa,
-                num_swa,
-                req_c4,
-                num_c4,
+                "PDBlockPool capping decode to share leftover with other-prefill: "
+                "decode %d→%d, other=%d (swa=%d, c4=%d, usable=%d, num_gpu_blocks=%d)",
                 req_decode,
                 num_decode,
                 other_prefill,
+                num_swa,
+                num_c4,
                 usable,
                 self.num_gpu_blocks,
             )
