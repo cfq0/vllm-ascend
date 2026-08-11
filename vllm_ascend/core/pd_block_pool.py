@@ -41,10 +41,10 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
 
-# Real SWA: 32 concurrent reqs * 8k tokens / block_size 128.
-SWA_KV_BLOCK_REGION_SIZE = 2048
-# C4 MLA group (compress KV + indexer): same order-of-magnitude default as SWA.
-C4_KV_BLOCK_REGION_SIZE = 2048
+# Real SWA: leave headroom for other-prefill (state / C128); was 2048, take 512.
+SWA_KV_BLOCK_REGION_SIZE = 1536
+# C4 MLA group (compress KV + indexer): same as SWA (2048 - 512).
+C4_KV_BLOCK_REGION_SIZE = 1536
 # Decode free-list size; leftover after SWA+C4+decode goes to other-prefill.
 DECODE_KV_BLOCK_REGION_SIZE = 64
 # Absolute floor for "other prefill" (C128 / compressor state / ...).
