@@ -44,6 +44,8 @@ logger = init_logger(__name__)
 SWA_KV_BLOCK_REGION_SIZE = 2048
 # C4 MLA group (compress KV + indexer): same order-of-magnitude default as SWA.
 C4_KV_BLOCK_REGION_SIZE = 2048
+# Absolute floor for "other prefill" (C128 / compressor state / ...).
+_MIN_OTHER_PREFILL_BLOCKS = 1
 
 
 @dataclass(frozen=True)
@@ -65,9 +67,9 @@ class PDBlockPoolConfig:
     num_decode_blocks: int | None = None
     # Keep a null block at id 0.
     reserve_null_block: bool = True
-    # Fixed SWA id region size (real SWA block_size=128).
+    # Target SWA id region size (real SWA block_size=128). May shrink to fit.
     num_swa_blocks: int = SWA_KV_BLOCK_REGION_SIZE
-    # Fixed C4 (+ indexer) id region size.
+    # Target C4 (+ indexer) id region size. May shrink to fit (before SWA).
     num_c4_blocks: int = C4_KV_BLOCK_REGION_SIZE
 
     def resolve(self) -> tuple[int, int, int, int, int, int]:
@@ -77,6 +79,9 @@ class PDBlockPoolConfig:
         C4 owns ``[swa_end, c4_end)``.
         Other prefill owns ``[c4_end, prefill_end)``.
         Decode owns ``[prefill_end, decode_end)``.
+
+        When the requested SWA/C4/decode sizes do not leave enough other-prefill
+        room on a small pool, shrink C4 first, then SWA, then decode.
         """
         if self.num_gpu_blocks < 2:
             raise ValueError("num_gpu_blocks must be >= 2")
@@ -90,12 +95,6 @@ class PDBlockPoolConfig:
             raise ValueError("SWA region must be > 0")
         if num_c4 <= 0:
             raise ValueError("C4 region must be > 0")
-        if num_swa + num_c4 >= usable:
-            raise ValueError(
-                f"SWA+C4 regions ({num_swa}+{num_c4}) leave no blocks for "
-                f"other prefill/decode (usable={usable}, "
-                f"num_gpu_blocks={self.num_gpu_blocks})"
-            )
 
         if self.num_decode_blocks is not None:
             num_decode = int(self.num_decode_blocks)
@@ -104,8 +103,58 @@ class PDBlockPoolConfig:
         if num_decode <= 0:
             raise ValueError("decode region must be > 0")
 
+        # Keep a non-trivial other-prefill floor on larger pools; always >= 1.
+        min_other = max(_MIN_OTHER_PREFILL_BLOCKS, min(num_decode, usable // 8))
+
+        req_swa, req_c4, req_decode = num_swa, num_c4, num_decode
+
+        def _fits(swa: int, c4: int, dec: int) -> bool:
+            return swa >= 1 and c4 >= 1 and dec >= 1 and (swa + c4 + dec + min_other) <= usable
+
+        if not _fits(num_swa, num_c4, num_decode):
+            # 1) Shrink decode if SWA+C4 floors (1+1) cannot coexist with it.
+            if usable < min_other + 2 + 1:
+                raise ValueError(
+                    f"num_gpu_blocks={self.num_gpu_blocks} too small for PD regions "
+                    f"(usable={usable}, min_other={min_other})"
+                )
+            max_decode = usable - min_other - 2
+            if num_decode > max_decode:
+                num_decode = max_decode
+
+            # 2) Fit SWA+C4 into the leftover budget; shrink C4 first, then SWA.
+            budget = usable - num_decode - min_other
+            if num_swa + num_c4 > budget:
+                if num_swa >= budget:
+                    num_swa = max(1, budget // 2)
+                    num_c4 = max(1, budget - num_swa)
+                else:
+                    num_c4 = max(1, budget - num_swa)
+
+            if not _fits(num_swa, num_c4, num_decode):
+                raise ValueError(
+                    f"Cannot fit PD regions into num_gpu_blocks={self.num_gpu_blocks} "
+                    f"(usable={usable}, swa={num_swa}, c4={num_c4}, decode={num_decode}, "
+                    f"min_other={min_other})"
+                )
+            logger.warning(
+                "PDBlockPool shrinking regions to fit pool: "
+                "swa %d→%d, c4 %d→%d, decode %d→%d "
+                "(usable=%d, min_other=%d, num_gpu_blocks=%d)",
+                req_swa,
+                num_swa,
+                req_c4,
+                num_c4,
+                req_decode,
+                num_decode,
+                usable,
+                min_other,
+                self.num_gpu_blocks,
+            )
+
         remaining = usable - num_swa - num_c4
-        if num_decode >= remaining:
+        other_prefill = remaining - num_decode
+        if other_prefill < _MIN_OTHER_PREFILL_BLOCKS:
             raise ValueError(
                 f"decode region ({num_decode}) leaves no other-prefill blocks "
                 f"(remaining_after_swa_c4={remaining}, swa={num_swa}, c4={num_c4}, "
@@ -115,7 +164,7 @@ class PDBlockPoolConfig:
         swa_start = usable_start
         swa_end = usable_start + num_swa
         c4_end = swa_end + num_c4
-        prefill_end = c4_end + (remaining - num_decode)
+        prefill_end = c4_end + other_prefill
         decode_end = self.num_gpu_blocks
         return null_id, swa_start, swa_end, c4_end, prefill_end, decode_end
 
