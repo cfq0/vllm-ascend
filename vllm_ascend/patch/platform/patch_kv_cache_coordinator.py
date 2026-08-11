@@ -29,7 +29,11 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend import envs
-from vllm_ascend.core.pd_block_pool import PDBlockPool, PDBlockPoolConfig
+from vllm_ascend.core.pd_block_pool import (
+    DECODE_KV_BLOCK_REGION_SIZE,
+    PDBlockPool,
+    PDBlockPoolConfig,
+)
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 
 USE_MULTI_GROUPS_KV_CACHE = True
@@ -109,9 +113,11 @@ def _build_block_pool(
         )
     pd_config = PDBlockPoolConfig(
         num_gpu_blocks=num_blocks,
-        max_num_decode_reqs=envs.VLLM_ASCEND_PD_MAX_NUM_DECODE_REQS,
-        max_blocks_per_decode_req=envs.VLLM_ASCEND_PD_MAX_BLOCKS_PER_DECODE_REQ,
-        num_decode_blocks=envs.VLLM_ASCEND_PD_NUM_DECODE_BLOCKS,
+        num_decode_blocks=(
+            envs.VLLM_ASCEND_PD_NUM_DECODE_BLOCKS
+            if envs.VLLM_ASCEND_PD_NUM_DECODE_BLOCKS is not None
+            else DECODE_KV_BLOCK_REGION_SIZE
+        ),
     )
     return PDBlockPool(
         num_gpu_blocks=num_blocks,

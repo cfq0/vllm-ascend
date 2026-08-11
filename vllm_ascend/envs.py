@@ -118,12 +118,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # decode uses a separate free-list so decode pops cannot fragment prefill.
     # Requires prefix caching disabled. Default off.
     "VLLM_ASCEND_ENABLE_PD_BLOCK_POOL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PD_BLOCK_POOL", "0"))),
-    # Decode-region sizing when PD pool is enabled (ignored if NUM_DECODE_BLOCKS set).
-    "VLLM_ASCEND_PD_MAX_NUM_DECODE_REQS": lambda: int(os.getenv("VLLM_ASCEND_PD_MAX_NUM_DECODE_REQS", "32")),
-    "VLLM_ASCEND_PD_MAX_BLOCKS_PER_DECODE_REQ": lambda: int(
-        os.getenv("VLLM_ASCEND_PD_MAX_BLOCKS_PER_DECODE_REQ", "32")
-    ),
-    # Explicit decode region size in blocks; empty/unset → size from the two fields above.
+    # Explicit decode region size in blocks; empty/unset → PDBlockPool default (64).
     "VLLM_ASCEND_PD_NUM_DECODE_BLOCKS": lambda: (
         int(v) if (v := os.getenv("VLLM_ASCEND_PD_NUM_DECODE_BLOCKS", "")) else None
     ),

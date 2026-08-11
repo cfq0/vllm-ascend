@@ -23,7 +23,8 @@ Scope (current):
 - Prefill / SWA / C4: bump allocator that prefers **id-contiguous** spans; on
   fragmentation, binary-searches the largest free contiguous chunk and
   repeats until the request is filled (may return several runs).
-- Decode: free-list sized for a small concurrent decode batch (default 32 reqs).
+- Decode: free-list sized small by default (64 blocks); leftover after
+  SWA+C4+decode goes to other-prefill (C128 / compressor state, ...).
 - Free routes by block-id range back to the owning region.
 """
 
@@ -44,6 +45,8 @@ logger = init_logger(__name__)
 SWA_KV_BLOCK_REGION_SIZE = 2048
 # C4 MLA group (compress KV + indexer): same order-of-magnitude default as SWA.
 C4_KV_BLOCK_REGION_SIZE = 2048
+# Decode free-list size; leftover after SWA+C4+decode goes to other-prefill.
+DECODE_KV_BLOCK_REGION_SIZE = 64
 # Absolute floor for "other prefill" (C128 / compressor state / ...).
 _MIN_OTHER_PREFILL_BLOCKS = 1
 
@@ -57,14 +60,9 @@ class PDBlockPoolConfig:
     """
 
     num_gpu_blocks: int
-    # Max concurrent decode requests (no MTP). Used only to size the decode
-    # region when ``num_decode_blocks`` is None.
-    max_num_decode_reqs: int = 32
-    # Upper bound of blocks one decode request may hold (e.g. SWA window /
-    # max_model_len / block_size). Required when ``num_decode_blocks`` is None.
-    max_blocks_per_decode_req: int = 32
-    # Explicit decode region size; overrides the two fields above when set.
-    num_decode_blocks: int | None = None
+    # Decode region size in blocks. Default is small; other-prefill takes the
+    # leftover after SWA+C4+decode so long prefills (state / C128) have room.
+    num_decode_blocks: int = DECODE_KV_BLOCK_REGION_SIZE
     # Keep a null block at id 0.
     reserve_null_block: bool = True
     # Fixed SWA id region size (real SWA block_size=128).
@@ -80,10 +78,9 @@ class PDBlockPoolConfig:
         Other prefill owns ``[c4_end, prefill_end)``.
         Decode owns ``[prefill_end, decode_end)``.
 
-        SWA/C4 keep their configured sizes. The leftover after SWA+C4 is split
-        so decode never exceeds half of that leftover (decode and other-prefill
-        share the tail; decode is also capped by the requested size). If the
-        leftover is too small to give both regions at least one block, raise.
+        SWA/C4/decode keep their configured sizes; all leftover after those
+        three goes to other-prefill. Raise if leftover cannot cover
+        other-prefill.
         """
         if self.num_gpu_blocks < 2:
             raise ValueError("num_gpu_blocks must be >= 2")
@@ -93,51 +90,23 @@ class PDBlockPoolConfig:
 
         num_swa = int(self.num_swa_blocks)
         num_c4 = int(self.num_c4_blocks)
+        num_decode = int(self.num_decode_blocks)
         if num_swa <= 0:
             raise ValueError("SWA region must be > 0")
         if num_c4 <= 0:
             raise ValueError("C4 region must be > 0")
-
-        if self.num_decode_blocks is not None:
-            req_decode = int(self.num_decode_blocks)
-        else:
-            req_decode = int(self.max_num_decode_reqs) * int(self.max_blocks_per_decode_req)
-        if req_decode <= 0:
+        if num_decode <= 0:
             raise ValueError("decode region must be > 0")
 
-        # Need at least 1 other-prefill + 1 decode after fixed SWA/C4.
-        min_tail = _MIN_OTHER_PREFILL_BLOCKS + 1
-        if num_swa + num_c4 + min_tail > usable:
+        reserved = num_swa + num_c4 + num_decode
+        if reserved + _MIN_OTHER_PREFILL_BLOCKS > usable:
             raise ValueError(
-                f"SWA+C4 regions ({num_swa}+{num_c4}) leave no room to split "
-                f"decode/other-prefill (need>={min_tail} leftover, usable={usable}, "
+                f"SWA+C4+decode ({num_swa}+{num_c4}+{num_decode}) leave no "
+                f"other-prefill blocks (usable={usable}, "
                 f"num_gpu_blocks={self.num_gpu_blocks})"
             )
 
-        tail = usable - num_swa - num_c4
-        # Decode and other-prefill split the tail: decode <= half(tail), and
-        # also <= requested decode size. Remainder goes to other-prefill.
-        num_decode = min(req_decode, max(1, tail // 2))
-        other_prefill = tail - num_decode
-        if num_decode < 1 or other_prefill < _MIN_OTHER_PREFILL_BLOCKS:
-            raise ValueError(
-                f"Cannot split decode/other-prefill from leftover after SWA/C4 "
-                f"(tail={tail}, decode={num_decode}, other={other_prefill}, "
-                f"swa={num_swa}, c4={num_c4}, num_gpu_blocks={self.num_gpu_blocks})"
-            )
-
-        if num_decode != req_decode:
-            logger.warning(
-                "PDBlockPool capping decode to share leftover with other-prefill: "
-                "decode %d→%d, other=%d (swa=%d, c4=%d, usable=%d, num_gpu_blocks=%d)",
-                req_decode,
-                num_decode,
-                other_prefill,
-                num_swa,
-                num_c4,
-                usable,
-                self.num_gpu_blocks,
-            )
+        other_prefill = usable - reserved
 
         swa_start = usable_start
         swa_end = usable_start + num_swa
@@ -569,8 +538,7 @@ def demo_pd_partition() -> None:
     # Need room for SWA + C4 + other prefill + decode.
     cfg = PDBlockPoolConfig(
         num_gpu_blocks=8192,
-        max_num_decode_reqs=32,
-        max_blocks_per_decode_req=2,  # decode region = 64
+        num_decode_blocks=DECODE_KV_BLOCK_REGION_SIZE,
         num_swa_blocks=SWA_KV_BLOCK_REGION_SIZE,
         num_c4_blocks=C4_KV_BLOCK_REGION_SIZE,
     )
