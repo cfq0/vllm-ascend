@@ -36,7 +36,7 @@ The allocator derives its plan from runtime host state:
 | Logical NPU map | `npu-smi info -m` | Maps card/chip IDs to global logical NPU IDs and gives `total_logic_npus`. |
 | Running NPUs | `npu-smi info` process table, filtered by `ASCEND_RT_VISIBLE_DEVICES` | Identifies the logical NPUs used by this worker process. |
 | Topology affinity | `npu-smi info -t topo` | Provides NPU-to-CPU affinity for `topo_affinity` mode. |
-| CPU NUMA map | `lscpu -e=CPU,NODE` | Used to extend single-NUMA affinity pools to the next NUMA node. |
+| CPU NUMA map | `lscpu -e=CPU,NODE` | Identifies the NUMA node of topo-affinity CPUs so ranks that share a node can split that node's CPUs. Also used by `migratepages`. |
 
 ### Strategy Selection
 
@@ -94,11 +94,14 @@ affinity groups.
 1. Build candidate NPUs from all logical NPUs:
    - always include running NPUs
    - include non-running NPUs only when their affinity overlaps this process's allowed cpuset
-2. For each candidate NPU, intersect topo affinity with `allowed_cpus`.
+2. For each candidate NPU, intersect topo affinity with `allowed_cpus`. Do not
+   extend into neighboring NUMA nodes.
 3. If the intersection is empty for a candidate, binding fails for this rank.
-4. If the affinity CPUs are all on one NUMA node, extend the pool with CPUs from the next NUMA node, constrained by `allowed_cpus`.
-5. Group NPUs with identical extended pools and split each shared pool evenly across that group.
-6. Keep only running NPUs in the final `npu_cpu_pool`.
+4. Group NPUs whose affinity CPUs sit on the same NUMA node. If multiple ranks
+   share that node, split the current NUMA node's CPUs (still constrained by
+   `allowed_cpus`) evenly across the group. Affinity that already spans multiple
+   NUMA nodes is split as-is and is not wrapped to another node.
+5. Keep only running NPUs in the final `npu_cpu_pool`.
 
 The non-running candidate step is intentional. It prevents two independent
 single-card workers from selecting the same CPU range when their visible NPUs
@@ -190,15 +193,15 @@ Inputs from an A2 topology:
 - Both processes have `allowed_cpus = [144..191]`
 
 The allocator includes the hidden same-affinity NPU as a candidate in each
-process, splits the shared extended pool, and then keeps only the visible NPU in
-the final pool.
+process, splits the shared topo-affinity CPUs on that NUMA node, and then keeps
+only the visible NPU in the final pool.
 
 Final pools:
 
 | Process | Visible NPU | Final CPU pool |
 | --- | --- | --- |
-| A | 0 | 144-167 |
-| B | 2 | 168-191 |
+| A | 0 | 144-155 |
+| B | 2 | 156-167 |
 
 This avoids overlapping CPU pools even when the two workers are launched as independent single-card services.
 

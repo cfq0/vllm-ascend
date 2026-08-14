@@ -260,18 +260,6 @@ class TestCpuAlloc(unittest.TestCase):
         mock_build_cpu_node_map.assert_called_once()
         mock_build_global_slice_cpu_pool.assert_called_once()
 
-    def test_extend_numa(self):
-        result = self.cpu_alloc.extend_numa([])
-        self.assertEqual(result, [])
-        self.cpu_alloc.cpu_node = {0: 0, 1: 0, 2: 1, 3: 1}
-        self.cpu_alloc.numa_to_cpu_map = {0: [0, 1], 1: [2, 3]}
-        self.cpu_alloc.device_info.allowed_cpus = [0, 1, 2, 3]
-        result = self.cpu_alloc.extend_numa([0, 1])
-        self.assertEqual(result, [0, 1, 2, 3])
-        self.cpu_alloc.device_info.allowed_cpus = [0, 1, 3]
-        result = self.cpu_alloc.extend_numa([0, 1])
-        self.assertEqual(result, [0, 1, 3])
-
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_build_cpu_node_map(self, mock_execute_command):
         mock_execute_command.return_value = ("", 0)
@@ -459,12 +447,6 @@ class TestCpuBindingSupplemental(unittest.TestCase):
 
         mock_execute_command.assert_called_once_with(["taskset", "-cp", "1,2", "123"])
 
-    def test_extend_numa_returns_original_list_when_multiple_nodes_present(self):
-        cpu_alloc = make_cpu_alloc()
-        cpu_alloc.cpu_node = {0: 0, 1: 1}
-
-        self.assertEqual(cpu_alloc.extend_numa([0, 1]), [0, 1])
-
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_build_cpu_node_map_skips_blank_and_header_rows(self, mock_execute_command):
         cpu_alloc = make_cpu_alloc()
@@ -497,10 +479,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         cpu_alloc.device_info.allowed_cpus = [0, 1, 2, 3]
         cpu_alloc.device_info.npu_affinity = {0: [0, 1], 1: [2, 3], 2: [2, 3]}
 
-        with (
-            patch.object(cpu_alloc, "build_cpu_node_map"),
-            patch.object(cpu_alloc, "extend_numa", side_effect=lambda cpus: cpus),
-        ):
+        with patch.object(cpu_alloc, "build_cpu_node_map"):
             cpu_alloc.build_cpu_pools()
 
         self.assertEqual(cpu_alloc.npu_cpu_pool, {0: [0, 1], 1: [2], 2: [3]})
@@ -513,10 +492,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         cpu_alloc.device_info.allowed_cpus = [192, 193]
         cpu_alloc.device_info.npu_affinity = {0: [192, 193], 1: [128, 129]}
 
-        with (
-            patch.object(cpu_alloc, "build_cpu_node_map"),
-            patch.object(cpu_alloc, "extend_numa", side_effect=lambda cpus: cpus),
-        ):
+        with patch.object(cpu_alloc, "build_cpu_node_map"):
             cpu_alloc.build_cpu_pools()
 
         self.assertEqual(cpu_alloc.npu_cpu_pool, {0: [192, 193]})
@@ -532,10 +508,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
             1: list(range(192, 202)),
         }
 
-        with (
-            patch.object(cpu_alloc, "build_cpu_node_map"),
-            patch.object(cpu_alloc, "extend_numa", side_effect=lambda cpus: cpus),
-        ):
+        with patch.object(cpu_alloc, "build_cpu_node_map"):
             cpu_alloc.build_cpu_pools()
             cpu_alloc.allocate()
 
@@ -560,10 +533,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
                 7: list(range(48, 72)),
             }
 
-            with (
-                patch.object(cpu_alloc, "build_cpu_node_map"),
-                patch.object(cpu_alloc, "extend_numa", return_value=list(range(144, 192))),
-            ):
+            with patch.object(cpu_alloc, "build_cpu_node_map"):
                 cpu_alloc.build_cpu_pools()
                 cpu_alloc.allocate()
             return cpu_alloc
@@ -571,12 +541,85 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         npu0_process = build_single_card_process(0)
         npu2_process = build_single_card_process(2)
 
-        self.assertEqual(npu0_process.npu_cpu_pool, {0: list(range(144, 168))})
-        self.assertEqual(npu2_process.npu_cpu_pool, {2: list(range(168, 192))})
+        # Stay inside topo affinity 144-167; do not extend into the next NUMA.
+        self.assertEqual(npu0_process.npu_cpu_pool, {0: list(range(144, 156))})
+        self.assertEqual(npu2_process.npu_cpu_pool, {2: list(range(156, 168))})
         self.assertFalse(set(npu0_process.npu_cpu_pool[0]) & set(npu2_process.npu_cpu_pool[2]))
         self.assertFalse(set(npu0_process.assign_main[0]) & set(npu2_process.assign_main[2]))
         self.assertFalse(set(npu0_process.assign_acl[0]) & set(npu2_process.assign_acl[2]))
         self.assertFalse(set(npu0_process.assign_rel[0]) & set(npu2_process.assign_rel[2]))
+
+    @staticmethod
+    def _fill_contiguous_numa(cpu_alloc, num_nodes, cpus_per_node):
+        for node in range(num_nodes):
+            cpus = list(range(node * cpus_per_node, (node + 1) * cpus_per_node))
+            cpu_alloc.numa_to_cpu_map[node] = cpus
+            for cpu in cpus:
+                cpu_alloc.cpu_node[cpu] = node
+
+    @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    def test_build_cpu_pools_topo_mode_splits_shared_numa_without_extending(self, _mock_get_device_type):
+        cpu_alloc = make_cpu_alloc()
+        cpu_alloc.device_info.all_logic_npus = list(range(8))
+        cpu_alloc.device_info.running_npu_list = list(range(8))
+        cpu_alloc.device_info.allowed_cpus = list(range(192))
+        cpu_alloc.device_info.npu_affinity = {
+            0: list(range(144, 168)),
+            1: list(range(0, 24)),
+            2: list(range(144, 168)),
+            3: list(range(0, 24)),
+            4: list(range(96, 120)),
+            5: list(range(48, 72)),
+            6: list(range(96, 120)),
+            7: list(range(48, 72)),
+        }
+        self._fill_contiguous_numa(cpu_alloc, num_nodes=8, cpus_per_node=24)
+
+        with patch.object(cpu_alloc, "build_cpu_node_map"):
+            cpu_alloc.build_cpu_pools()
+
+        expected = {
+            0: list(range(144, 156)),
+            2: list(range(156, 168)),
+            1: list(range(0, 12)),
+            3: list(range(12, 24)),
+            4: list(range(96, 108)),
+            6: list(range(108, 120)),
+            5: list(range(48, 60)),
+            7: list(range(60, 72)),
+        }
+        self.assertEqual(cpu_alloc.npu_cpu_pool, expected)
+        assigned = [set(cpus) for cpus in cpu_alloc.npu_cpu_pool.values()]
+        for i, left in enumerate(assigned):
+            for right in assigned[i + 1 :]:
+                self.assertFalse(left & right)
+
+    @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    def test_build_cpu_pools_topo_mode_does_not_wrap_to_neighbor_numa(self, _mock_get_device_type):
+        cpu_alloc = make_cpu_alloc()
+        cpu_alloc.device_info.all_logic_npus = list(range(8))
+        cpu_alloc.device_info.running_npu_list = list(range(8))
+        cpu_alloc.device_info.allowed_cpus = list(range(192))
+        cpu_alloc.device_info.npu_affinity = {
+            0: list(range(144, 192)),
+            1: list(range(0, 48)),
+            2: list(range(144, 192)),
+            3: list(range(0, 48)),
+            4: list(range(96, 144)),
+            5: list(range(48, 96)),
+            6: list(range(96, 144)),
+            7: list(range(48, 96)),
+        }
+        self._fill_contiguous_numa(cpu_alloc, num_nodes=4, cpus_per_node=48)
+
+        with patch.object(cpu_alloc, "build_cpu_node_map"):
+            cpu_alloc.build_cpu_pools()
+
+        self.assertEqual(cpu_alloc.npu_cpu_pool[0], list(range(144, 168)))
+        self.assertEqual(cpu_alloc.npu_cpu_pool[2], list(range(168, 192)))
+        self.assertEqual(cpu_alloc.npu_cpu_pool[1], list(range(0, 24)))
+        self.assertEqual(cpu_alloc.npu_cpu_pool[3], list(range(24, 48)))
+        self.assertFalse(set(cpu_alloc.npu_cpu_pool[0]) & set(cpu_alloc.npu_cpu_pool[1]))
 
     @patch("vllm_ascend.cpu_binding.logger.info")
     def test_print_plan_handles_empty_release_assignment(self, mock_logger_info):

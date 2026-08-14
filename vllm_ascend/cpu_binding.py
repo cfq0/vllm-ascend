@@ -206,8 +206,9 @@ class CpuAlloc:
 
     def average_distribute(self, groups: dict[str, list[int]]) -> dict[int, list[int]]:
         result: dict[int, list[int]] = {}
-        for key, npu_list in groups.items():
+        for _key, npu_list in groups.items():
             cpu_list = sorted(self.npu_cpu_pool[npu_list[0]])
+            npu_list = sorted(npu_list)
             cpu_num_per_npu = len(cpu_list) // len(npu_list)
             for i, npu in enumerate(npu_list):
                 start_index = i * cpu_num_per_npu
@@ -215,19 +216,28 @@ class CpuAlloc:
                 result[npu] = cpu_list[start_index:end_index]
         return result
 
-    def extend_numa(self, cpu_list: list[int]) -> list[int]:
-        if not cpu_list:
-            return []
-        nodes = {self.cpu_node[c] for c in cpu_list}
-        if len(nodes) != 1:
-            return cpu_list
-        node = list(nodes)[0]
-        next_node = (node + 1) % len(self.numa_to_cpu_map)
-        extended = cpu_list[:]
-        for cpu in self.numa_to_cpu_map[next_node]:
-            if cpu in self.device_info.allowed_cpus:
-                extended.append(cpu)
-        return sorted(set(extended))
+    def _numa_key_for_cpus(self, cpu_list: list[int]) -> tuple:
+        """Group key: NUMA node ids of affinity CPUs, or the CPU tuple if unknown."""
+        nodes = tuple(sorted({self.cpu_node[c] for c in cpu_list if c in self.cpu_node}))
+        if nodes:
+            return ("numa",) + nodes
+        return ("affinity", tuple(cpu_list))
+
+    def _shared_cpus_for_group(
+        self, numa_key: tuple, npu_list: list[int], allowed_cpu_set: set[int]
+    ) -> list[int]:
+        """CPUs to split among NPUs that share a NUMA node or the same affinity list.
+
+        When all affinity CPUs sit on one NUMA node, split that node's CPUs
+        (intersected with the allowed cpuset). Do not pull in neighboring NUMA
+        nodes. Multi-NUMA affinity falls back to the shared topo affinity list.
+        """
+        if numa_key[0] == "numa" and len(numa_key) == 2:
+            node = numa_key[1]
+            split_cpus = sorted(cpu for cpu in self.numa_to_cpu_map.get(node, []) if cpu in allowed_cpu_set)
+            if split_cpus:
+                return split_cpus
+        return sorted(self.npu_cpu_pool[npu_list[0]])
 
     def build_cpu_node_map(self) -> None:
         cpu_numa_map, _ = execute_command(["lscpu", "-e=CPU,NODE"])
@@ -332,7 +342,9 @@ class CpuAlloc:
             self.build_global_slice_cpu_pool()
             return
 
-        # topo_affinity mode
+        # topo_affinity mode: bind strictly to npu-smi topo CPU affinity.
+        # Ranks that share one NUMA node split that node's CPUs; do not extend
+        # into neighboring NUMA nodes.
         if not self.device_info.npu_affinity:
             logger.warning("NPU topo affinity not found, fallback to global-slice CPU binding.")
             self.build_global_slice_cpu_pool()
@@ -354,19 +366,22 @@ class CpuAlloc:
             ]
             if not base_cpu_list:
                 raise RuntimeError("CPUs available in 'Cpus_allowed_list' conflict with NUMA affinity.")
-            extra_cpu_list = self.extend_numa(base_cpu_list)
-            self.npu_cpu_pool[npu] = extra_cpu_list
+            self.npu_cpu_pool[npu] = sorted(base_cpu_list)
 
-        groups = defaultdict(list)
+        groups: dict[tuple, list[int]] = defaultdict(list)
         for npu, cpus in self.npu_cpu_pool.items():
-            groups[str(cpus)].append(npu)
+            groups[self._numa_key_for_cpus(cpus)].append(npu)
 
         final: dict[int, list[int]] = {}
-        for key, npu_list in groups.items():
+        for numa_key, npu_list in groups.items():
+            npu_list = sorted(npu_list)
             if len(npu_list) == 1:
                 final[npu_list[0]] = self.npu_cpu_pool[npu_list[0]]
-            else:
-                final.update(self.average_distribute({key: npu_list}))
+                continue
+            split_cpus = self._shared_cpus_for_group(numa_key, npu_list, allowed_cpu_set)
+            for npu in npu_list:
+                self.npu_cpu_pool[npu] = split_cpus
+            final.update(self.average_distribute({str(split_cpus): npu_list}))
         # Keep only visible NPUs in the final binding pool. Non-visible NPUs are used only to avoid overlap.
         self.npu_cpu_pool = {npu: final[npu] for npu in self.device_info.running_npu_list}
 
