@@ -54,17 +54,32 @@ def _layer_kv_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
     return [spec]
 
 
-def _is_swa_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
-    """True for real SWA KV (SlidingWindowMLASpec, block_size=128).
+def _is_main_model_swa_layer(name: str) -> bool:
+    """True for main-model DeepseekV4SWACache (``*.swa_cache``).
 
-    DSv4 packs SWA layers into one ``UniformTypeKVCacheSpecs`` group.
-    Compressor state caches also use SlidingWindowMLASpec but with
-    block_size 8/32 and must keep using the non-SWA PD regions.
+    DSv4 also registers MTP ``*.swa_cache`` and compressor ``*.state_cache``
+    as SlidingWindowMLASpec; those must not use the prefill SWA region.
     """
-    specs = _layer_kv_specs(manager.kv_cache_spec)
-    return bool(specs) and all(
+    dotted = f".{name}."
+    return ".swa_cache" in dotted and ".mtp." not in dotted and ".state_cache." not in dotted
+
+
+def _is_swa_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
+    """True for main-model SWA KV (DeepseekV4SWACache, block_size=128).
+
+    Spec class + block_size=128 is not enough: v4 has a second SWA manager
+    for MTP (same SlidingWindowMLASpec / 128) that belongs in other-prefill.
+    """
+    spec = manager.kv_cache_spec
+    specs = _layer_kv_specs(spec)
+    if not specs or not all(
         isinstance(s, SlidingWindowMLASpec) and int(s.block_size) == _SWA_KV_BLOCK_SIZE for s in specs
-    )
+    ):
+        return False
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        names = list(spec.kv_cache_specs.keys())
+        return bool(names) and any(_is_main_model_swa_layer(n) for n in names)
+    return getattr(spec, "model_version", None) == "deepseek_v4"
 
 
 def _is_c4_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
@@ -282,9 +297,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 )
             if _is_swa_kv_manager(manager):
                 swa_need += n
+                names = (
+                    list(manager.kv_cache_spec.kv_cache_specs.keys())[:2]
+                    if isinstance(manager.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else [type(manager.kv_cache_spec).__name__]
+                )
                 print(
-                    f"[PDAdmit] SWA need req={request_id} n={n} swa_need={swa_need} "
-                    f"num_tokens={num_tokens} is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
+                    f"[PDAdmit] SWA need req={request_id} manager={i} n={n} "
+                    f"swa_need={swa_need} num_tokens={num_tokens} "
+                    f"layers={names} "
+                    f"is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
                     flush=True,
                 )
             elif _is_c4_kv_manager(manager):
