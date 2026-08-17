@@ -7,22 +7,29 @@ prefill contiguous runs (important for DSA-CP SWA ``copy_`` / C4 scatter localit
 
 Layout (null block at 0)::
 
-    [1, 1+SWA)           SWA bump (real SWA block_size=128, **prefill only**)
-    [1+SWA, 1+SWA+C4)    C4 + indexer MLA bump (**prefill only**, contiguous)
-    [1+SWA+C4, P)        other prefill bump (C128 + compressor state, ...)
+    [1, 1+SWA)           SWA size-class slabs (**prefill only**, contiguous)
+    [1+SWA, 1+SWA+C4)    C4 + indexer MLA size-class slabs (**prefill only**, contiguous)
+    [1+SWA+C4, P)        other prefill free-list (C128 + compressor state)
     [P, N)               decode free-list (all groups, including SWA/C4 in decode)
 
+SWA and C4 are carved into fixed **size-class slabs**::
+
+    64 x 8 / 128 x 4 / 256 x 2   (= 1536 ids when the region is full)
+
+Allocation for SWA/C4 picks the smallest slab class ``>= n`` and takes ``n``
+contiguous ids from one of that class's slabs (never stitches runs across
+slabs). If all slabs of that class are busy, the request escalates to the
+next larger class. Other prefill and decode use a free-list; ids need not
+be contiguous.
+
 Routing:
-- Prefill + real SWA → SWA bump.
-- Prefill + C4 MLA group (compress_ratio==4, includes indexer) → C4 bump.
-- Prefill + other → remaining prefill bump.
+- Prefill + real SWA → SWA region.
+- Prefill + C4 MLA group (compress_ratio==4, includes indexer) → C4 region.
+- Prefill + other → remaining prefill region.
 - Decode (any group) → decode free-list (avoids punching holes in SWA/C4).
 
 Scope (current):
 - Prefix cache / PCP / MTP are not supported; enable only with caching off.
-- Prefill / SWA / C4: bump allocator that prefers **id-contiguous** spans; on
-  fragmentation, binary-searches the largest free contiguous chunk and
-  repeats until the request is filled (may return several runs).
 - Decode: free-list sized small by default (64 blocks); leftover after
   SWA+C4+decode goes to other-prefill (C128 / compressor state, ...).
 - Free routes by block-id range back to the owning region.
@@ -41,10 +48,25 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
 
-# Real SWA: leave headroom for other-prefill (state / C128); was 2048, take 512.
-SWA_KV_BLOCK_REGION_SIZE = 1536
-# C4 MLA group (compress KV + indexer): same as SWA (2048 - 512).
-C4_KV_BLOCK_REGION_SIZE = 1536
+# Prefill size-class slabs (64×8 + 128×4 + 256×2 → 1536 ids).
+# Token span at SWA/C4 block_size=128: 8k / 16k / 32k.
+PREFILL_SIZE_CLASS_SLABS: tuple[tuple[int, int], ...] = (
+    (64, 8),
+    (128, 4),
+    (256, 2),
+)
+PREFILL_SIZE_CLASSES = tuple(cls for cls, _ in PREFILL_SIZE_CLASS_SLABS)
+
+
+def size_class_region_blocks(
+    class_slabs: tuple[tuple[int, int], ...] = PREFILL_SIZE_CLASS_SLABS,
+) -> int:
+    return sum(cls * count for cls, count in class_slabs)
+
+
+# SWA / C4 regions are exactly one full size-class template.
+SWA_KV_BLOCK_REGION_SIZE = size_class_region_blocks()
+C4_KV_BLOCK_REGION_SIZE = size_class_region_blocks()
 # Decode free-list size; leftover after SWA+C4+decode goes to other-prefill.
 DECODE_KV_BLOCK_REGION_SIZE = 64
 # Absolute floor for "other prefill" (C128 / compressor state / ...).
@@ -116,64 +138,87 @@ class PDBlockPoolConfig:
         return null_id, swa_start, swa_end, c4_end, prefill_end, decode_end
 
 
-class _PrefillBumpRegion:
-    """Contiguous bump allocator over ``[start, end)`` with wrap-around search."""
+def plan_size_class_slabs(
+    start: int,
+    capacity: int,
+    class_slabs: tuple[tuple[int, int], ...] = PREFILL_SIZE_CLASS_SLABS,
+) -> list[tuple[int, int, int]]:
+    """Carve ``[start, start+capacity)`` into size-class slabs.
 
-    def __init__(self, start: int, end: int, name: str = "prefill") -> None:
+    Returns ``[(slab_start, slab_end, class_size), ...]``. Template copies are
+    placed first (``class_slabs``). Any leftover capacity becomes one overflow
+    slab whose class_size equals the leftover length.
+    """
+    if capacity <= 0:
+        return []
+    slabs: list[tuple[int, int, int]] = []
+    cursor = start
+    remaining = capacity
+    stop_template = False
+    for cls, count in class_slabs:
+        if stop_template:
+            break
+        for _ in range(count):
+            if remaining < cls:
+                stop_template = True
+                break
+            slabs.append((cursor, cursor + cls, cls))
+            cursor += cls
+            remaining -= cls
+    if remaining > 0:
+        slabs.append((cursor, cursor + remaining, remaining))
+    return slabs
+
+
+class _SizeClassSlab:
+    """One contiguous id span of a fixed class size."""
+
+    def __init__(self, start: int, end: int, class_size: int) -> None:
         if end <= start:
-            raise ValueError(f"empty {name} region [{start}, {end})")
-        self.name = name
+            raise ValueError(f"empty slab [{start}, {end})")
         self.start = start
         self.end = end
+        self.class_size = class_size
         self.capacity = end - start
-        # Free flags for ids in this region (index = block_id - start).
         self._free = [True] * self.capacity
         self._num_free = self.capacity
-        # Next candidate id for bump allocation.
         self._cursor = start
 
     @property
     def num_free(self) -> int:
         return self._num_free
 
-    def allocate_contiguous(self, n: int) -> list[int]:
-        """Allocate ``n`` free blocks, preferring long contiguous id runs.
+    def contains(self, block_id: int) -> bool:
+        return self.start <= block_id < self.end
 
-        1. Try one contiguous span of length ``n``.
-        2. If fragmented, repeatedly binary-search the largest feasible
-           contiguous span ``k <= remaining`` and take it, until ``n`` is met.
-           Result may be several contiguous runs (still better than random ids).
-        """
-        if n <= 0:
-            return []
-        if n > self._num_free:
-            raise ValueError(f"{self.name} region: need {n} free blocks, only {self._num_free} left")
-
-        # Fast path: one contiguous span.
-        span = self._find_contiguous_span(n)
-        if span is not None:
-            return self._take_span(span, n)
-
-        # Fragmented: keep taking the largest contiguous chunk via binary search.
-        out: list[int] = []
-        remaining = n
-        while remaining > 0:
-            first, length = self._find_largest_contiguous_span(remaining)
-            if length <= 0 or first is None:
-                raise ValueError(
-                    f"{self.name} region: need {n} blocks, allocated {n - remaining}, "
-                    f"free={self._num_free} but no free contiguous span left (fragmented)"
-                )
-            out.extend(self._take_span(first, length))
-            remaining -= length
-
-        return out
+    def try_allocate(self, n: int) -> list[int] | None:
+        """Return ``n`` contiguous ids in this slab, or None if they do not fit."""
+        if n <= 0 or n > self._num_free or n > self.capacity:
+            return None
+        first = self._find_contiguous_span(n)
+        if first is None:
+            return None
+        return self._take_span(first, n)
 
     def free(self, block_ids: list[int]) -> None:
         for bid in block_ids:
-            if not (self.start <= bid < self.end):
-                raise ValueError(f"block {bid} not in {self.name} region [{self.start}, {self.end})")
+            if not self.contains(bid):
+                raise ValueError(f"block {bid} not in slab [{self.start}, {self.end})")
             self._mark_free(bid)
+
+    def _find_contiguous_span(self, n: int) -> int | None:
+        # Search from cursor to end, then from start to cursor (no wrap across end).
+        for first in range(self._cursor, self.end - n + 1):
+            if self._is_free_range(first, n):
+                return first
+        for first in range(self.start, min(self._cursor, self.end - n + 1)):
+            if self._is_free_range(first, n):
+                return first
+        return None
+
+    def _is_free_range(self, first: int, n: int) -> bool:
+        base = first - self.start
+        return all(self._free[base + i] for i in range(n))
 
     def _take_span(self, first: int, n: int) -> list[int]:
         out = list(range(first, first + n))
@@ -184,51 +229,10 @@ class _PrefillBumpRegion:
             self._cursor = self.start
         return out
 
-    def _find_contiguous_span(self, n: int) -> int | None:
-        """Return start id of a free contiguous span of length n, or None."""
-        if n <= 0 or n > self.capacity:
-            return None
-        # Linear scan with wrap from cursor. A single span must not wrap past end.
-        for offset in range(self.capacity):
-            first = self.start + ((self._cursor - self.start + offset) % self.capacity)
-            if first + n <= self.end and self._is_free_range(first, n):
-                return first
-        return None
-
-    def _find_largest_contiguous_span(self, max_n: int) -> tuple[int | None, int]:
-        """Binary-search the largest ``k in [1, max_n]`` with a free contiguous span.
-
-        Returns ``(start_id, k)`` or ``(None, 0)`` if nothing free.
-        """
-        max_n = min(max_n, self._num_free, self.capacity)
-        if max_n <= 0:
-            return None, 0
-
-        lo, hi = 1, max_n
-        best_first: int | None = None
-        best_k = 0
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            first = self._find_contiguous_span(mid)
-            if first is not None:
-                best_first = first
-                best_k = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best_first, best_k
-
-    def _is_free_range(self, first: int, n: int) -> bool:
-        base = first - self.start
-        for i in range(n):
-            if not self._free[base + i]:
-                return False
-        return True
-
     def _mark_used(self, bid: int) -> None:
         idx = bid - self.start
         if not self._free[idx]:
-            raise RuntimeError(f"{self.name} block {bid} already allocated")
+            raise RuntimeError(f"slab block {bid} already allocated")
         self._free[idx] = False
         self._num_free -= 1
 
@@ -240,14 +244,96 @@ class _PrefillBumpRegion:
         self._num_free += 1
 
 
-class _DecodeFreeListRegion:
-    """Simple free-list for decode; fragmentation is acceptable."""
+class _PrefillSizeClassRegion:
+    """Prefill region split into size-class slabs (64×8 / 128×4 / 256×2).
 
-    def __init__(self, start: int, end: int) -> None:
+    ``allocate_contiguous(n)`` always returns one contiguous id run from a
+    single slab. It never stitches fragments across slabs.
+    """
+
+    def __init__(
+        self,
+        start: int,
+        end: int,
+        name: str = "prefill",
+        class_slabs: tuple[tuple[int, int], ...] = PREFILL_SIZE_CLASS_SLABS,
+    ) -> None:
         if end <= start:
-            raise ValueError(f"empty decode region [{start}, {end})")
+            raise ValueError(f"empty {name} region [{start}, {end})")
+        self.name = name
         self.start = start
         self.end = end
+        self.capacity = end - start
+        self.class_slabs = class_slabs
+        planned = plan_size_class_slabs(start, self.capacity, class_slabs)
+        self.slabs = [_SizeClassSlab(s, e, cls) for s, e, cls in planned]
+        self._slabs_by_class: dict[int, list[_SizeClassSlab]] = {}
+        for slab in self.slabs:
+            self._slabs_by_class.setdefault(slab.class_size, []).append(slab)
+        # Unique class sizes in escalating order (template classes first, overflow last).
+        seen: list[int] = []
+        for cls, _count in class_slabs:
+            if cls in self._slabs_by_class and cls not in seen:
+                seen.append(cls)
+        for cls in sorted(self._slabs_by_class):
+            if cls not in seen:
+                seen.append(cls)
+        self._class_order = seen
+        logger.info(
+            "PD %s size-class slabs: %s",
+            name,
+            ", ".join(f"{s.class_size}@[{s.start},{s.end})" for s in self.slabs),
+        )
+
+    @property
+    def num_free(self) -> int:
+        return sum(slab.num_free for slab in self.slabs)
+
+    def allocate_contiguous(self, n: int) -> list[int]:
+        """Allocate ``n`` contiguous ids from the matching size-class slab.
+
+        Picks the smallest class ``>= n``, then larger classes if those slabs
+        cannot fit ``n``. Never returns a non-contiguous or multi-slab id list.
+        """
+        if n <= 0:
+            return []
+        if n > self.num_free:
+            raise ValueError(f"{self.name} region: need {n} free blocks, only {self.num_free} left")
+
+        for cls in self._class_order:
+            if cls < n:
+                continue
+            for slab in self._slabs_by_class[cls]:
+                got = slab.try_allocate(n)
+                if got is not None:
+                    return got
+
+        raise ValueError(
+            f"{self.name} region: need {n} contiguous blocks but no size-class "
+            f"slab can fit them (classes={self._class_order}, free={self.num_free})"
+        )
+
+    def free(self, block_ids: list[int]) -> None:
+        for bid in block_ids:
+            self._slab_for_id(bid).free([bid])
+
+    def _slab_for_id(self, block_id: int) -> _SizeClassSlab:
+        for slab in self.slabs:
+            if slab.contains(block_id):
+                return slab
+        raise ValueError(f"block {block_id} not in {self.name} region [{self.start}, {self.end})")
+
+
+class _FreeListRegion:
+    """Simple free-list; fragmentation is acceptable (other-prefill / decode)."""
+
+    def __init__(self, start: int, end: int, name: str = "free-list") -> None:
+        if end <= start:
+            raise ValueError(f"empty {name} region [{start}, {end})")
+        self.name = name
+        self.start = start
+        self.end = end
+        self.capacity = end - start
         self._free: deque[int] = deque(range(start, end))
 
     @property
@@ -258,13 +344,13 @@ class _DecodeFreeListRegion:
         if n <= 0:
             return []
         if n > len(self._free):
-            raise ValueError(f"decode region: need {n} free blocks, only {len(self._free)} left")
+            raise ValueError(f"{self.name} region: need {n} free blocks, only {len(self._free)} left")
         return [self._free.popleft() for _ in range(n)]
 
     def free(self, block_ids: list[int]) -> None:
         for bid in block_ids:
             if not (self.start <= bid < self.end):
-                raise ValueError(f"block {bid} not in decode region [{self.start}, {self.end})")
+                raise ValueError(f"block {bid} not in {self.name} region [{self.start}, {self.end})")
             self._free.append(bid)
 
 
@@ -274,7 +360,7 @@ class PDBlockPool(BlockPool):
     Call :meth:`set_alloc_is_prefill` / :meth:`set_alloc_is_swa` /
     :meth:`set_alloc_is_c4` before ``get_new_blocks`` / ``get_num_free_blocks``
     so admission and allocation use the correct region. Free always routes by
-    block-id range.
+    block-id range. SWA/C4 use size-class slabs; other prefill is a free-list.
     """
 
     def __init__(
@@ -316,10 +402,10 @@ class PDBlockPool(BlockPool):
             self.free_block_queue.popleft_n(n_free)
         assert self.free_block_queue.num_free_blocks == 0
 
-        self.swa = _PrefillBumpRegion(swa_start, swa_end, name="swa")
-        self.c4 = _PrefillBumpRegion(swa_end, c4_end, name="c4")
-        self.prefill = _PrefillBumpRegion(c4_end, prefill_end, name="prefill")
-        self.decode = _DecodeFreeListRegion(prefill_end, decode_end)
+        self.swa = _PrefillSizeClassRegion(swa_start, swa_end, name="swa")
+        self.c4 = _PrefillSizeClassRegion(swa_end, c4_end, name="c4")
+        self.prefill = _FreeListRegion(c4_end, prefill_end, name="prefill")
+        self.decode = _FreeListRegion(prefill_end, decode_end, name="decode")
         # None = unset (treat as total free for get_num_free_blocks).
         self._alloc_is_prefill: bool | None = None
         self._alloc_is_swa: bool | None = None
@@ -444,7 +530,7 @@ class PDBlockPool(BlockPool):
             )
 
         # Decode phase: all groups use the decode free-list so incremental
-        # decode pops do not punch holes in SWA/C4 bump regions.
+        # decode pops do not punch holes in SWA/C4 size-class slabs.
         if not is_prefill:
             region_free = self.decode.num_free
             if num_blocks > region_free:
@@ -476,7 +562,7 @@ class PDBlockPool(BlockPool):
                     f"Cannot get {num_blocks} free blocks from the prefill PD region "
                     f"(free={region_free})"
                 )
-            ids = self.prefill.allocate_contiguous(num_blocks)
+            ids = self.prefill.allocate(num_blocks)
 
         ret = [self.blocks[bid] for bid in ids]
         for block in ret:
@@ -549,6 +635,7 @@ def demo_pd_partition() -> None:
         pd_config=cfg,
     )
     print(pool.summary())
+    print("swa slabs", [(s.class_size, s.start, s.end) for s in pool.swa.slabs])
 
     pool.set_alloc_is_prefill(True)
     pool.set_alloc_is_swa(True)

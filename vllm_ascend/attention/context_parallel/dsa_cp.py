@@ -2,7 +2,6 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -30,12 +29,9 @@ from vllm_ascend.utils import (
 )
 
 # (token_start, length, slot_start): slots[token_start + t] == slot_start + t
-# May span multiple consecutive block_ids when linear slots are contiguous.
+# SWA/C4 prefill: one run per request (size-class PD alloc is id-contiguous).
 ContiguousSlotRun = tuple[int, int, int]
 
-# Prefill: shorter runs go to scatter. Decode never uses copy_runs.
-# A copy_ run must cover at least MIN_CONTIGUOUS_BLOCKS consecutive block_ids.
-MIN_CONTIGUOUS_BLOCKS = 2
 # Real SWA / C4 MLA(+indexer) use block_size=128; state caches use 8/32 and must be skipped.
 SWA_KV_BLOCK_SIZE = 128
 C4_COMPRESS_RATIO = 4
@@ -72,6 +68,10 @@ def _build_compressed_query_start_loc(
     return torch.tensor(out, dtype=torch.int64, device="cpu")
 
 
+def _is_pad_slot(slot: int, pad_slot_id: int) -> bool:
+    return slot < 0 or slot == pad_slot_id
+
+
 def plan_kv_slot_writes(
     slot_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -81,29 +81,26 @@ def plan_kv_slot_writes(
     device: torch.device | None = None,
     block_size: int = 128,
 ) -> tuple[list[ContiguousSlotRun], torch.Tensor]:
-    """Plan KV writes: consecutive-block prefill ``copy_`` runs + scatter.
+    """Plan SWA/C4 KV writes without scanning consecutive-slot runs.
 
-    Used by real SWA and C4 MLA (+ indexer) caches.
-
-    - Decode (``req_idx < num_decodes``): all valid tokens → scatter.
-    - Prefill: tokens whose block_ids are consecutive (>= MIN_CONTIGUOUS_BLOCKS)
-      → one copy_ run covering all those blocks.
+    Size-class PD allocation gives each SWA/C4 prefill request contiguous
+    block ids, so prefill is one ``copy_`` per request. Decode (and draft)
+    tokens go to scatter. ``block_size`` is unused and kept for callers.
     """
+    del block_size
     if device is None:
         device = slot_mapping.device if slot_mapping is not None else torch.device("cpu")
     empty_scatter = torch.empty(0, dtype=torch.int32, device=device)
     if slot_mapping is None or slot_mapping.numel() == 0 or num_reqs <= 0:
         return [], empty_scatter
-    if block_size <= 0:
-        block_size = 1
 
     slots = slot_mapping.detach()
     if slots.device.type != "cpu":
         slots = slots.cpu()
-    slot_ids = slots.reshape(-1).numpy()
-    if slot_ids.dtype != np.int64:
-        slot_ids = slot_ids.astype(np.int64, copy=False)
-    num_slots = int(slot_ids.size)
+    slot_ids = slots.reshape(-1)
+    if slot_ids.dtype != torch.int64:
+        slot_ids = slot_ids.to(torch.int64)
+    num_slots = int(slot_ids.numel())
 
     qsl = query_start_loc.detach()
     if qsl.device.type != "cpu":
@@ -113,7 +110,19 @@ def plan_kv_slot_writes(
     copy_runs: list[ContiguousSlotRun] = []
     scatter_idxs: list[int] = []
 
-    for req_idx in range(num_reqs):
+    n_decodes = min(num_decodes, num_reqs)
+    for req_idx in range(n_decodes):
+        begin = int(req_bounds[req_idx])
+        end = min(int(req_bounds[req_idx + 1]), num_slots)
+        if begin >= num_slots or end <= begin:
+            if begin >= num_slots:
+                break
+            continue
+        seg = slot_ids[begin:end]
+        valid = (seg >= 0) & (seg != pad_slot_id)
+        scatter_idxs.extend((torch.nonzero(valid, as_tuple=False).flatten() + begin).tolist())
+
+    for req_idx in range(n_decodes, num_reqs):
         begin = int(req_bounds[req_idx])
         end = min(int(req_bounds[req_idx + 1]), num_slots)
         if begin >= num_slots or end <= begin:
@@ -121,50 +130,19 @@ def plan_kv_slot_writes(
                 break
             continue
 
-        # Decode: scatter only (never record copy_runs).
-        if req_idx < num_decodes:
-            seg = slot_ids[begin:end]
-            valid = (seg >= 0) & (seg != pad_slot_id)
-            scatter_idxs.extend((np.flatnonzero(valid) + begin).tolist())
+        # Trim pad slots at the request edges only; do not scan for holes.
+        first_slot = int(slot_ids[begin].item())
+        last_slot = int(slot_ids[end - 1].item())
+        if not _is_pad_slot(first_slot, pad_slot_id) and not _is_pad_slot(last_slot, pad_slot_id):
+            copy_runs.append((begin, end - begin, first_slot))
             continue
-
-        # Prefill (vectorized): split into consecutive-slot runs, then
-        # copy_ if the run spans >= MIN_CONTIGUOUS_BLOCKS block_ids.
-        seg = slot_ids[begin:end]
-        n = int(seg.size)
-        if n == 0:
+        while begin < end and _is_pad_slot(int(slot_ids[begin].item()), pad_slot_id):
+            begin += 1
+        while end > begin and _is_pad_slot(int(slot_ids[end - 1].item()), pad_slot_id):
+            end -= 1
+        if end <= begin:
             continue
-        valid = (seg >= 0) & (seg != pad_slot_id)
-        # Break before i unless i continues a consecutive valid slot from i-1.
-        new_run = np.empty(n, dtype=bool)
-        new_run[0] = True
-        new_run[1:] = ~(valid[1:] & valid[:-1] & (seg[1:] == seg[:-1] + 1))
-        run_ids = np.cumsum(new_run)
-
-        v_pos = np.flatnonzero(valid)
-        if v_pos.size == 0:
-            continue
-        v_run = run_ids[v_pos]
-        # Group starts within valid tokens (run_id changes).
-        grp_start = np.empty(v_pos.size, dtype=bool)
-        grp_start[0] = True
-        grp_start[1:] = v_run[1:] != v_run[:-1]
-        g0 = np.flatnonzero(grp_start)
-        g1 = np.empty(g0.size, dtype=np.int64)
-        g1[:-1] = g0[1:]
-        g1[-1] = v_pos.size
-
-        for gs, ge in zip(g0.tolist(), g1.tolist()):
-            tok_start = begin + int(v_pos[gs])
-            run_len = int(ge - gs)
-            slot_start = int(seg[v_pos[gs]])
-            start_block = slot_start // block_size
-            end_block = (slot_start + run_len - 1) // block_size
-            num_blocks = end_block - start_block + 1
-            if num_blocks >= MIN_CONTIGUOUS_BLOCKS:
-                copy_runs.append((tok_start, run_len, slot_start))
-            else:
-                scatter_idxs.extend(range(tok_start, tok_start + run_len))
+        copy_runs.append((begin, end - begin, int(slot_ids[begin].item())))
 
     if not scatter_idxs:
         return copy_runs, empty_scatter
@@ -249,8 +227,8 @@ class AscendDSAReqMetadata:
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
     # Builder-time KV write plan (see plan_kv_slot_writes): SWA + C4 MLA/indexer.
-    # - contiguous_slot_runs: consecutive-slot prefill copy_ (may span blocks)
-    # - scatter_token_indices: decode + short prefill fragments
+    # - contiguous_slot_runs: one copy_ per SWA/C4 prefill request
+    # - scatter_token_indices: decode / draft tokens
     contiguous_slot_runs: list[ContiguousSlotRun] | None = None
     scatter_token_indices: torch.Tensor | None = None
 
@@ -473,7 +451,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         # Real SWA (ratio<=1) and C4 MLA/indexer (ratio==4): block_size=128.
         # Skip state caches (SlidingWindowMLA, block_size 8/32).
-        # Decode → scatter; prefill → consecutive-slot copy_ (may span blocks).
+        # Decode → scatter; SWA/C4 prefill → one copy_ per request.
         contiguous_slot_runs: list[ContiguousSlotRun] | None = None
         scatter_token_indices: torch.Tensor | None = None
         plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
@@ -1243,7 +1221,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         contiguous_slot_runs: list[ContiguousSlotRun] | None,
         scatter_token_indices: torch.Tensor | None,
     ) -> None:
-        """Write KV cache: consecutive-slot ``copy_`` runs, then scatter.
+        """Write KV cache: SWA/C4 prefill ``copy_`` runs, then decode scatter.
 
         Used by SWA and C4 MLA (+ indexer). If no plan was built, fall back to
         full scatter (legacy path).

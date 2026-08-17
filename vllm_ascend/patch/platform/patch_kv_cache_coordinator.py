@@ -74,7 +74,7 @@ def _is_c4_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
 
 
 def _set_pd_alloc_region(pool: PDBlockPool, manager: SingleTypeKVCacheManager, use_prefill_regions: bool) -> None:
-    """Route one manager alloc to SWA / C4 / other-prefill bump (prefill only)."""
+    """Route one manager alloc to SWA / C4 / other-prefill region (prefill only)."""
     if not use_prefill_regions:
         pool.clear_alloc_is_swa()
         pool.clear_alloc_is_c4()
@@ -292,7 +292,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 pool.clear_pending_swa_blocks()
                 pool.clear_pending_c4_blocks()
                 return swa_need + c4_need + other_need
-            # Prefill: split SWA / C4 bumps vs remaining prefill bump.
+            # Prefill: split SWA / C4 size-class regions vs remaining prefill.
             pool.set_pending_swa_blocks(swa_need)
             pool.set_pending_c4_blocks(c4_need)
             return other_need
@@ -318,7 +318,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             assert all(len(blocks) == 0 for blocks in new_computed_blocks)
             return
 
-        # Prefill-only bump regions; decode ignores SWA/C4 flags and uses decode region.
+        # Prefill-only size-class regions; decode ignores SWA/C4 flags and uses decode region.
         use_prefill_regions = pool._alloc_is_prefill is True
         try:
             managers = self.single_type_managers
@@ -369,7 +369,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 num_encoder_tokens,
             )
 
-        # Prefill-only bump regions; decode ignores SWA/C4 flags and uses decode region.
+        # Prefill-only size-class regions; decode ignores SWA/C4 flags and uses decode region.
         use_prefill_regions = pool._alloc_is_prefill is True
         results: list[list[KVCacheBlock]] = []
         try:
