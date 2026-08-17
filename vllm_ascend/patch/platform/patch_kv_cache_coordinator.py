@@ -47,30 +47,32 @@ except ImportError:  # pragma: no cover
     CrossAttentionManager = None  # type: ignore[misc, assignment]
 
 
+def _layer_kv_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
+    """Unwrap ``UniformTypeKVCacheSpecs`` to per-layer specs."""
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return list(spec.kv_cache_specs.values())
+    return [spec]
+
+
 def _is_swa_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
     """True for real SWA KV (SlidingWindowMLASpec, block_size=128).
 
-    Compressor state caches also use SlidingWindowMLASpec but with block_size
-    8/32 and must keep using the non-SWA PD regions.
+    DSv4 packs SWA layers into one ``UniformTypeKVCacheSpecs`` group.
+    Compressor state caches also use SlidingWindowMLASpec but with
+    block_size 8/32 and must keep using the non-SWA PD regions.
     """
-    spec = manager.kv_cache_spec
-    return isinstance(spec, SlidingWindowMLASpec) and int(spec.block_size) == _SWA_KV_BLOCK_SIZE
+    specs = _layer_kv_specs(manager.kv_cache_spec)
+    return bool(specs) and all(
+        isinstance(s, SlidingWindowMLASpec) and int(s.block_size) == _SWA_KV_BLOCK_SIZE for s in specs
+    )
 
 
 def _is_c4_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
     """True for DeepSeek V4 C4 MLA group (compress KV + indexer, ratio==4)."""
-    spec = manager.kv_cache_spec
-    if isinstance(spec, MLAAttentionSpec):
-        return int(getattr(spec, "compress_ratio", 1)) == _C4_COMPRESS_RATIO
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        inner = list(spec.kv_cache_specs.values())
-        if not inner:
-            return False
-        return all(
-            isinstance(s, MLAAttentionSpec) and int(getattr(s, "compress_ratio", 1)) == _C4_COMPRESS_RATIO
-            for s in inner
-        )
-    return False
+    specs = _layer_kv_specs(manager.kv_cache_spec)
+    return bool(specs) and all(
+        isinstance(s, MLAAttentionSpec) and int(getattr(s, "compress_ratio", 1)) == _C4_COMPRESS_RATIO for s in specs
+    )
 
 
 def _set_pd_alloc_region(pool: PDBlockPool, manager: SingleTypeKVCacheManager, use_prefill_regions: bool) -> None:
@@ -249,7 +251,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         num_tokens_main_model: int | None = None,
         apply_admission_cap: bool = False,
     ) -> int:
-        """Prefill: other-prefill need (+ stash SWA/C4). Decode: total vs decode region."""
+        """Prefill: other-prefill need. Decode: total vs decode region."""
         if num_tokens_main_model is None:
             num_tokens_main_model = num_tokens
         swa_need = 0
@@ -280,6 +282,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 )
             if _is_swa_kv_manager(manager):
                 swa_need += n
+                print(
+                    f"[PDAdmit] SWA need req={request_id} n={n} swa_need={swa_need} "
+                    f"num_tokens={num_tokens} is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
+                    flush=True,
+                )
             elif _is_c4_kv_manager(manager):
                 c4_need += n
             else:
@@ -287,14 +294,19 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         pool = self.block_pool
         if isinstance(pool, PDBlockPool):
-            # Decode: every group draws from the decode free-list.
             if pool._alloc_is_prefill is False:
-                pool.clear_pending_swa_blocks()
-                pool.clear_pending_c4_blocks()
                 return swa_need + c4_need + other_need
-            # Prefill: split SWA / C4 size-class regions vs remaining prefill.
-            pool.set_pending_swa_blocks(swa_need)
-            pool.set_pending_c4_blocks(c4_need)
+            if swa_need > pool.swa.num_free or c4_need > pool.c4.num_free:
+                print(
+                    f"[PDAdmit] reject req={request_id} "
+                    f"swa_need={swa_need} swa_free={pool.swa.num_free} "
+                    f"c4_need={c4_need} c4_free={pool.c4.num_free} "
+                    f"other_need={other_need} other_free={pool.prefill.num_free} "
+                    f"return={pool.prefill.num_free + 1}",
+                    flush=True,
+                )
+                # Fail ``need <= get_num_free_blocks()``; probe returns other-prefill free.
+                return pool.prefill.num_free + 1
             return other_need
         return swa_need + c4_need + other_need
 
@@ -590,8 +602,6 @@ def _allocate_slots_with_pd_region(self: KVCacheManager, request, *args, **kwarg
     finally:
         pool.clear_alloc_is_swa()
         pool.clear_alloc_is_c4()
-        pool.clear_pending_swa_blocks()
-        pool.clear_pending_c4_blocks()
         pool.clear_alloc_is_prefill()
 
 

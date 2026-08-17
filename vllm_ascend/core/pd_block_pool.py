@@ -380,9 +380,6 @@ class PDBlockPool(BlockPool):
         self._alloc_is_prefill: bool | None = None
         self._alloc_is_swa: bool | None = None
         self._alloc_is_c4: bool | None = None
-        # Set by coordinator.get_num_blocks_to_allocate for split admission.
-        self._pending_swa_blocks: int | None = None
-        self._pending_c4_blocks: int | None = None
 
         logger.info(
             "PDBlockPool enabled: swa=[%d,%d) (%d blocks), "
@@ -423,8 +420,6 @@ class PDBlockPool(BlockPool):
 
     def clear_alloc_is_prefill(self) -> None:
         self._alloc_is_prefill = None
-        self._pending_swa_blocks = None
-        self._pending_c4_blocks = None
 
     def set_alloc_is_swa(self, is_swa: bool) -> None:
         self._alloc_is_swa = is_swa
@@ -442,40 +437,9 @@ class PDBlockPool(BlockPool):
     def clear_alloc_is_c4(self) -> None:
         self._alloc_is_c4 = None
 
-    def set_pending_swa_blocks(self, num_swa_blocks: int) -> None:
-        """Record SWA need for the next ``get_num_free_blocks`` admission check."""
-        self._pending_swa_blocks = int(num_swa_blocks)
-
-    def clear_pending_swa_blocks(self) -> None:
-        self._pending_swa_blocks = None
-
-    def set_pending_c4_blocks(self, num_c4_blocks: int) -> None:
-        """Record C4 need for the next ``get_num_free_blocks`` admission check."""
-        self._pending_c4_blocks = int(num_c4_blocks)
-
-    def clear_pending_c4_blocks(self) -> None:
-        self._pending_c4_blocks = None
-
     def get_num_free_blocks(self) -> int:
-        # Decode: all groups share the decode free-list.
         if self._alloc_is_prefill is False:
             return self.decode.num_free
-
-        # Prefill split admission: coordinator returns only "other prefill" need;
-        # hard-fail if SWA/C4 cannot be satisfied (do not soft-fail via -1 / None).
-        if self._pending_swa_blocks is not None or self._pending_c4_blocks is not None:
-            if self._pending_swa_blocks is not None and self._pending_swa_blocks > self.swa.num_free:
-                raise ValueError(
-                    f"SWA PD region cannot satisfy request: need={self._pending_swa_blocks}, "
-                    f"free={self.swa.num_free}, region=[{self.swa.start}, {self.swa.end})"
-                )
-            if self._pending_c4_blocks is not None and self._pending_c4_blocks > self.c4.num_free:
-                raise ValueError(
-                    f"C4 PD region cannot satisfy request: need={self._pending_c4_blocks}, "
-                    f"free={self.c4.num_free}, region=[{self.c4.start}, {self.c4.end})"
-                )
-            return self.prefill.num_free
-
         if self._alloc_is_swa is True:
             return self.swa.num_free
         if self._alloc_is_c4 is True:

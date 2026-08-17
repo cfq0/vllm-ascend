@@ -51,29 +51,24 @@ def _build_compressed_query_start_loc(
     num_reqs: int,
     compress_ratio: int,
 ) -> torch.Tensor:
-    """Map original-token ``query_start_loc`` into compressed-token bounds."""
-    if compress_ratio <= 1 or num_reqs <= 0:
-        qsl = query_start_loc.detach()
-        return qsl.cpu() if qsl.device.type != "cpu" else qsl
+    """Map original-token ``query_start_loc`` into compressed-token bounds.
 
-    pos = input_positions.detach()
-    if pos.device.type != "cpu":
-        pos = pos.cpu()
-    qsl = query_start_loc.detach()
-    if qsl.device.type != "cpu":
-        qsl = qsl.cpu()
-    bounds = qsl[: num_reqs + 1].tolist()
-    out = [0]
-    for req_idx in range(num_reqs):
-        begin = int(bounds[req_idx])
-        end = int(bounds[req_idx + 1])
-        if end <= begin:
-            out.append(out[-1])
-            continue
-        seg = pos[begin:end]
-        n_cmp = int(((seg + 1) % compress_ratio == 0).sum().item())
-        out.append(out[-1] + n_cmp)
-    return torch.tensor(out, dtype=torch.int64, device="cpu")
+    ``input_positions`` and ``query_start_loc`` must already be on CPU
+    (builder passes ``input_positions_cpu`` / ``query_start_loc_cpu``).
+    """
+    if compress_ratio <= 1 or num_reqs <= 0:
+        return query_start_loc[: num_reqs + 1]
+
+    qsl = query_start_loc[: num_reqs + 1].long()
+    n_pos = input_positions.numel()
+    cmp_cu = torch.zeros(n_pos + 1, dtype=torch.int64)
+    if n_pos:
+        cmp_cu[1:] = ((input_positions.long() + 1) % compress_ratio == 0).cumsum(0)
+    bounds = qsl.clamp(min=0, max=n_pos)
+    cmp_counts = cmp_cu[bounds[1:]] - cmp_cu[bounds[:-1]]
+    out = torch.zeros(num_reqs + 1, dtype=torch.int64)
+    out[1:] = cmp_counts.cumsum(0)
+    return out
 
 
 def plan_kv_block_writes(
@@ -429,11 +424,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         plan_c4 = self.compressor_ratio == C4_COMPRESS_RATIO
         plan_swa = self.compressor_ratio <= 1
         if plan_block_size == SWA_KV_BLOCK_SIZE and (plan_swa or plan_c4):
-            qsl = (
-                common_attn_metadata.query_start_loc_cpu
-                if common_attn_metadata.query_start_loc_cpu is not None
-                else common_attn_metadata.query_start_loc
-            )
+            qsl = common_attn_metadata.query_start_loc_cpu
+            if qsl is None:
+                qsl = common_attn_metadata.query_start_loc
             if plan_c4:
                 qsl = _build_compressed_query_start_loc(
                     input_positions_cpu,

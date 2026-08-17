@@ -7,7 +7,10 @@
 import torch
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.context_parallel.dsa_cp import plan_kv_block_writes
+from vllm_ascend.attention.context_parallel.dsa_cp import (
+    _build_compressed_query_start_loc,
+    plan_kv_block_writes,
+)
 
 
 class TestPlanKvBlockWrites(TestBase):
@@ -68,3 +71,44 @@ class TestPlanKvBlockWrites(TestBase):
         qsl = torch.tensor([0, 128], dtype=torch.int64)
         plan, _ = plan_kv_block_writes(block_table, qsl, num_reqs=1, num_decodes=0, block_size=128)
         self.assertEqual(plan.first_blocks.device, block_table.device)
+
+
+class TestBuildCompressedQueryStartLoc(TestBase):
+    def test_counts_compress_hits_per_request(self):
+        # pos 0..7, ratio 4: compress at pos 3 and 7.
+        pos = torch.arange(8, dtype=torch.int64)
+        qsl = torch.tensor([0, 4, 8], dtype=torch.int64)
+        out = _build_compressed_query_start_loc(pos, qsl, num_reqs=2, compress_ratio=4)
+        self.assertEqual(out.tolist(), [0, 1, 2])
+        self.assertEqual(out.device.type, "cpu")
+
+    def test_empty_request_keeps_bound(self):
+        pos = torch.arange(4, dtype=torch.int64)
+        qsl = torch.tensor([0, 0, 4], dtype=torch.int64)
+        out = _build_compressed_query_start_loc(pos, qsl, num_reqs=2, compress_ratio=4)
+        self.assertEqual(out.tolist(), [0, 0, 1])
+
+    def test_offset_positions_chunked_prefill(self):
+        # Chunk starting at pos 4: compress at 7 only.
+        pos = torch.arange(4, 8, dtype=torch.int64)
+        qsl = torch.tensor([0, 4], dtype=torch.int64)
+        out = _build_compressed_query_start_loc(pos, qsl, num_reqs=1, compress_ratio=4)
+        self.assertEqual(out.tolist(), [0, 1])
+
+    def test_passthrough_when_not_compressed(self):
+        qsl = torch.tensor([0, 3, 5], dtype=torch.int64)
+        pos = torch.arange(5, dtype=torch.int64)
+        out = _build_compressed_query_start_loc(pos, qsl, num_reqs=2, compress_ratio=1)
+        self.assertEqual(out.tolist(), [0, 3, 5])
+
+    def test_matches_per_request_mask_sum(self):
+        pos = torch.tensor([2, 3, 4, 5, 6, 7, 8, 9], dtype=torch.int64)
+        qsl = torch.tensor([0, 3, 3, 8], dtype=torch.int64)
+        ratio = 4
+        out = _build_compressed_query_start_loc(pos, qsl, num_reqs=3, compress_ratio=ratio)
+        expected = [0]
+        for i in range(3):
+            begin, end = int(qsl[i]), int(qsl[i + 1])
+            n_cmp = int(((pos[begin:end] + 1) % ratio == 0).sum())
+            expected.append(expected[-1] + n_cmp)
+        self.assertEqual(out.tolist(), expected)
