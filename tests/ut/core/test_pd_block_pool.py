@@ -51,6 +51,17 @@ class TestPrefillSizeClassRegion(TestBase):
         slab = region.slabs[0]
         self.assertEqual(slab.class_size, 64)
         self.assertTrue(slab.contains(ids[0]))
+        self.assertEqual(ids[0], slab.start)
+        self.assertEqual(slab.num_free, 0)
+
+    def test_partial_alloc_occupies_whole_slab(self):
+        region = self._region()
+        first = region.allocate_contiguous(50)
+        second = region.allocate_contiguous(50)
+        self.assertEqual(region.slabs[0].start, first[0])
+        self.assertEqual(region.slabs[1].start, second[0])
+        self.assertEqual(region.slabs[0].class_size, 64)
+        self.assertEqual(region.slabs[1].class_size, 64)
 
     def test_eight_64_slabs_then_escalate_to_128(self):
         region = self._region()

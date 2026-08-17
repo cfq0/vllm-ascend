@@ -7,65 +7,64 @@
 import torch
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.context_parallel.dsa_cp import plan_kv_slot_writes
+from vllm_ascend.attention.context_parallel.dsa_cp import plan_kv_block_writes
 
 
-class TestPlanKvSlotWrites(TestBase):
-    def test_decode_only_scatters_valid_tokens(self):
-        slots = torch.tensor([10, 20, -1, 40], dtype=torch.int64)
-        qsl = torch.tensor([0, 1, 2, 4], dtype=torch.int64)
-        runs, scatter = plan_kv_slot_writes(
-            slots, qsl, num_reqs=3, num_decodes=3, pad_slot_id=-1, device=torch.device("cpu")
-        )
-        self.assertEqual(runs, [])
-        self.assertEqual(scatter.tolist(), [0, 1, 3])
+class TestPlanKvBlockWrites(TestBase):
+    def test_decode_only_has_no_copy_runs(self):
+        block_table = torch.zeros((3, 8), dtype=torch.int32)
+        qsl = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=3, num_decodes=3, block_size=128)
+        self.assertFalse(plan)
+        self.assertEqual(scatter.numel(), 0)
 
-    def test_prefill_one_copy_per_request(self):
-        # Two prefills; slots are contiguous within each request (size-class).
-        slots = torch.tensor(list(range(128, 128 + 256)) + list(range(512, 512 + 64)), dtype=torch.int64)
+    def test_prefill_counts_whole_blocks(self):
+        block_table = torch.zeros((2, 8), dtype=torch.int32)
+        block_table[0, 0] = 1
+        block_table[1, 0] = 10
         qsl = torch.tensor([0, 256, 320], dtype=torch.int64)
-        runs, scatter = plan_kv_slot_writes(
-            slots, qsl, num_reqs=2, num_decodes=0, pad_slot_id=-1, device=torch.device("cpu")
-        )
-        self.assertEqual(runs, [(0, 256, 128), (256, 64, 512)])
+        plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=2, num_decodes=0, block_size=128)
+        self.assertEqual(plan.token_starts.tolist(), [0, 256])
+        self.assertEqual(plan.num_blocks.tolist(), [2, 1])
+        self.assertEqual(plan.n_tokens.tolist(), [256, 64])
+        self.assertEqual(plan.first_blocks.tolist(), [1, 10])
         self.assertEqual(scatter.numel(), 0)
 
-    def test_mixed_decode_scatter_and_prefill_copy(self):
-        slots = torch.tensor([7, 9, 100, 101, 102, 103], dtype=torch.int64)
+    def test_mixed_decode_then_prefill_rounds_up(self):
+        block_table = torch.zeros((3, 4), dtype=torch.int32)
+        block_table[2, 0] = 5
         qsl = torch.tensor([0, 1, 2, 6], dtype=torch.int64)
-        runs, scatter = plan_kv_slot_writes(
-            slots, qsl, num_reqs=3, num_decodes=2, pad_slot_id=-1, device=torch.device("cpu")
-        )
-        self.assertEqual(scatter.tolist(), [0, 1])
-        self.assertEqual(runs, [(2, 4, 100)])
-
-    def test_prefill_trims_edge_pads_only(self):
-        slots = torch.tensor([-1, 200, 201, 202, -1], dtype=torch.int64)
-        qsl = torch.tensor([0, 5], dtype=torch.int64)
-        runs, scatter = plan_kv_slot_writes(
-            slots, qsl, num_reqs=1, num_decodes=0, pad_slot_id=-1, device=torch.device("cpu")
-        )
-        self.assertEqual(runs, [(1, 3, 200)])
+        plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=3, num_decodes=2, block_size=128)
         self.assertEqual(scatter.numel(), 0)
+        self.assertEqual(plan.token_starts.tolist(), [2])
+        self.assertEqual(plan.num_blocks.tolist(), [1])
+        self.assertEqual(plan.n_tokens.tolist(), [4])
+        self.assertEqual(plan.first_blocks.tolist(), [5])
 
-    def test_short_prefill_still_copy(self):
-        # Previously MIN_CONTIGUOUS_BLOCKS=2 sent 1-block prefills to scatter.
-        slots = torch.tensor(list(range(64)), dtype=torch.int64)
-        qsl = torch.tensor([0, 64], dtype=torch.int64)
-        runs, scatter = plan_kv_slot_writes(
-            slots, qsl, num_reqs=1, num_decodes=0, pad_slot_id=-1, device=torch.device("cpu")
-        )
-        self.assertEqual(runs, [(0, 64, 0)])
-        self.assertEqual(scatter.numel(), 0)
+    def test_short_prefill_still_one_block(self):
+        block_table = torch.zeros((1, 4), dtype=torch.int32)
+        block_table[0, 0] = 3
+        qsl = torch.tensor([0, 50], dtype=torch.int64)
+        plan, _ = plan_kv_block_writes(block_table, qsl, num_reqs=1, num_decodes=0, block_size=128)
+        self.assertEqual(plan.token_starts.tolist(), [0])
+        self.assertEqual(plan.num_blocks.tolist(), [1])
+        self.assertEqual(plan.n_tokens.tolist(), [50])
+        self.assertEqual(plan.first_blocks.tolist(), [3])
 
-    def test_empty_mapping(self):
-        runs, scatter = plan_kv_slot_writes(
-            torch.empty(0, dtype=torch.int64),
+    def test_empty(self):
+        plan, scatter = plan_kv_block_writes(
+            torch.zeros((0, 1), dtype=torch.int32),
             torch.tensor([0], dtype=torch.int64),
             num_reqs=0,
             num_decodes=0,
-            pad_slot_id=-1,
-            device=torch.device("cpu"),
+            block_size=128,
         )
-        self.assertEqual(runs, [])
+        self.assertFalse(plan)
         self.assertEqual(scatter.numel(), 0)
+
+    def test_first_blocks_stay_on_block_table_device(self):
+        block_table = torch.zeros((1, 4), dtype=torch.int32)
+        block_table[0, 0] = 7
+        qsl = torch.tensor([0, 128], dtype=torch.int64)
+        plan, _ = plan_kv_block_writes(block_table, qsl, num_reqs=1, num_decodes=0, block_size=128)
+        self.assertEqual(plan.first_blocks.device, block_table.device)

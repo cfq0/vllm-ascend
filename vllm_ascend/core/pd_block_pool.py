@@ -16,11 +16,12 @@ SWA and C4 are carved into fixed **size-class slabs**::
 
     64 x 8 / 128 x 4 / 256 x 2   (= 1536 ids when the region is full)
 
-Allocation for SWA/C4 picks the smallest slab class ``>= n`` and takes ``n``
-contiguous ids from one of that class's slabs (never stitches runs across
-slabs). If all slabs of that class are busy, the request escalates to the
-next larger class. Other prefill and decode use a free-list; ids need not
-be contiguous.
+Allocation for SWA/C4 picks the smallest free slab whose class is ``>= n``
+and takes ``n`` ids from that slab's start. A slab is occupied as a whole
+(leftover ids stay reserved) until every given-out id is freed; never
+searches inside a slab or stitches across slabs. If every slab of that
+class is busy, the request escalates to the next larger class. Other
+prefill and decode use a free-list; ids need not be contiguous.
 
 Routing:
 - Prefill + real SWA → SWA region.
@@ -171,7 +172,11 @@ def plan_size_class_slabs(
 
 
 class _SizeClassSlab:
-    """One contiguous id span of a fixed class size."""
+    """One contiguous id span of a fixed class size.
+
+    Occupied as a whole: ``try_allocate(n)`` takes ``[start, start+n)`` from a
+    free slab and keeps leftover ids reserved until every given-out id is freed.
+    """
 
     def __init__(self, start: int, end: int, class_size: int) -> None:
         if end <= start:
@@ -180,75 +185,40 @@ class _SizeClassSlab:
         self.end = end
         self.class_size = class_size
         self.capacity = end - start
-        self._free = [True] * self.capacity
-        self._num_free = self.capacity
-        self._cursor = start
+        self._busy = False
+        self._live: set[int] = set()
 
     @property
     def num_free(self) -> int:
-        return self._num_free
+        return 0 if self._busy else self.capacity
 
     def contains(self, block_id: int) -> bool:
         return self.start <= block_id < self.end
 
     def try_allocate(self, n: int) -> list[int] | None:
-        """Return ``n`` contiguous ids in this slab, or None if they do not fit."""
-        if n <= 0 or n > self._num_free or n > self.capacity:
+        """Return ``n`` ids from this slab's start, or None if the slab is busy."""
+        if n <= 0 or n > self.capacity or self._busy:
             return None
-        first = self._find_contiguous_span(n)
-        if first is None:
-            return None
-        return self._take_span(first, n)
+        ids = list(range(self.start, self.start + n))
+        self._busy = True
+        self._live = set(ids)
+        return ids
 
     def free(self, block_ids: list[int]) -> None:
         for bid in block_ids:
             if not self.contains(bid):
                 raise ValueError(f"block {bid} not in slab [{self.start}, {self.end})")
-            self._mark_free(bid)
-
-    def _find_contiguous_span(self, n: int) -> int | None:
-        # Search from cursor to end, then from start to cursor (no wrap across end).
-        for first in range(self._cursor, self.end - n + 1):
-            if self._is_free_range(first, n):
-                return first
-        for first in range(self.start, min(self._cursor, self.end - n + 1)):
-            if self._is_free_range(first, n):
-                return first
-        return None
-
-    def _is_free_range(self, first: int, n: int) -> bool:
-        base = first - self.start
-        return all(self._free[base + i] for i in range(n))
-
-    def _take_span(self, first: int, n: int) -> list[int]:
-        out = list(range(first, first + n))
-        for bid in out:
-            self._mark_used(bid)
-        self._cursor = first + n
-        if self._cursor >= self.end:
-            self._cursor = self.start
-        return out
-
-    def _mark_used(self, bid: int) -> None:
-        idx = bid - self.start
-        if not self._free[idx]:
-            raise RuntimeError(f"slab block {bid} already allocated")
-        self._free[idx] = False
-        self._num_free -= 1
-
-    def _mark_free(self, bid: int) -> None:
-        idx = bid - self.start
-        if self._free[idx]:
-            return
-        self._free[idx] = True
-        self._num_free += 1
+            self._live.discard(bid)
+        if not self._live:
+            self._busy = False
 
 
 class _PrefillSizeClassRegion:
     """Prefill region split into size-class slabs (64×8 / 128×4 / 256×2).
 
     ``allocate_contiguous(n)`` always returns one contiguous id run from a
-    single slab. It never stitches fragments across slabs.
+    single free slab (ids from that slab's start). It never searches inside
+    a slab or stitches fragments across slabs.
     """
 
     def __init__(
@@ -290,10 +260,10 @@ class _PrefillSizeClassRegion:
         return sum(slab.num_free for slab in self.slabs)
 
     def allocate_contiguous(self, n: int) -> list[int]:
-        """Allocate ``n`` contiguous ids from the matching size-class slab.
+        """Allocate ``n`` contiguous ids from one free size-class slab.
 
-        Picks the smallest class ``>= n``, then larger classes if those slabs
-        cannot fit ``n``. Never returns a non-contiguous or multi-slab id list.
+        Picks the smallest class ``>= n``, then the first free slab of that
+        class (or a larger class if all smaller matching slabs are busy).
         """
         if n <= 0:
             return []
