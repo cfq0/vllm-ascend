@@ -8,6 +8,7 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.attention.context_parallel.dsa_cp import (
+    PrefillCopyRun,
     _build_compressed_query_start_loc,
     plan_kv_block_writes,
 )
@@ -19,6 +20,7 @@ class TestPlanKvBlockWrites(TestBase):
         qsl = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=3, num_decodes=3, block_size=128)
         self.assertFalse(plan)
+        self.assertEqual(plan.decode_end, 3)
         self.assertEqual(scatter.numel(), 0)
 
     def test_prefill_counts_whole_blocks(self):
@@ -27,10 +29,14 @@ class TestPlanKvBlockWrites(TestBase):
         block_table[1, 0] = 10
         qsl = torch.tensor([0, 256, 320], dtype=torch.int64)
         plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=2, num_decodes=0, block_size=128)
-        self.assertEqual(plan.token_starts.tolist(), [0, 256])
-        self.assertEqual(plan.num_blocks.tolist(), [2, 1])
-        self.assertEqual(plan.n_tokens.tolist(), [256, 64])
-        self.assertEqual(plan.first_blocks.tolist(), [1, 10])
+        self.assertEqual(plan.decode_end, 0)
+        self.assertEqual(
+            plan.prefill_runs,
+            (
+                PrefillCopyRun(token_start=0, n_tokens=256, first_block=1, n_blocks=2),
+                PrefillCopyRun(token_start=256, n_tokens=64, first_block=10, n_blocks=1),
+            ),
+        )
         self.assertEqual(scatter.numel(), 0)
 
     def test_mixed_decode_then_prefill_rounds_up(self):
@@ -39,20 +45,21 @@ class TestPlanKvBlockWrites(TestBase):
         qsl = torch.tensor([0, 1, 2, 6], dtype=torch.int64)
         plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=3, num_decodes=2, block_size=128)
         self.assertEqual(scatter.numel(), 0)
-        self.assertEqual(plan.token_starts.tolist(), [2])
-        self.assertEqual(plan.num_blocks.tolist(), [1])
-        self.assertEqual(plan.n_tokens.tolist(), [4])
-        self.assertEqual(plan.first_blocks.tolist(), [5])
+        self.assertEqual(plan.decode_end, 2)
+        self.assertEqual(
+            plan.prefill_runs,
+            (PrefillCopyRun(token_start=2, n_tokens=4, first_block=5, n_blocks=1),),
+        )
 
     def test_short_prefill_still_one_block(self):
         block_table = torch.zeros((1, 4), dtype=torch.int32)
         block_table[0, 0] = 3
         qsl = torch.tensor([0, 50], dtype=torch.int64)
         plan, _ = plan_kv_block_writes(block_table, qsl, num_reqs=1, num_decodes=0, block_size=128)
-        self.assertEqual(plan.token_starts.tolist(), [0])
-        self.assertEqual(plan.num_blocks.tolist(), [1])
-        self.assertEqual(plan.n_tokens.tolist(), [50])
-        self.assertEqual(plan.first_blocks.tolist(), [3])
+        self.assertEqual(
+            plan.prefill_runs,
+            (PrefillCopyRun(token_start=0, n_tokens=50, first_block=3, n_blocks=1),),
+        )
 
     def test_empty(self):
         plan, scatter = plan_kv_block_writes(
@@ -65,12 +72,12 @@ class TestPlanKvBlockWrites(TestBase):
         self.assertFalse(plan)
         self.assertEqual(scatter.numel(), 0)
 
-    def test_first_blocks_stay_on_block_table_device(self):
-        block_table = torch.zeros((1, 4), dtype=torch.int32)
-        block_table[0, 0] = 7
-        qsl = torch.tensor([0, 128], dtype=torch.int64)
-        plan, _ = plan_kv_block_writes(block_table, qsl, num_reqs=1, num_decodes=0, block_size=128)
-        self.assertEqual(plan.first_blocks.device, block_table.device)
+    def test_noncontiguous_blocks_fall_back_to_scatter(self):
+        block_table = torch.tensor([[7, 9, 0, 0]], dtype=torch.int32)
+        qsl = torch.tensor([0, 256], dtype=torch.int64)
+        plan, scatter = plan_kv_block_writes(block_table, qsl, num_reqs=1, num_decodes=0, block_size=128)
+        self.assertIsNone(plan)
+        self.assertEqual(scatter.numel(), 0)
 
 
 class TestBuildCompressedQueryStartLoc(TestBase):

@@ -2871,6 +2871,9 @@ class NPUModelRunner(GPUModelRunner):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
+            block_table_cpu=self.input_batch.block_table[0].get_cpu_tensor()[
+                :num_reqs_padded
+            ],
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
@@ -2992,6 +2995,9 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+                cm.block_table_cpu = self.input_batch.block_table[
+                    kv_cache_gid
+                ].get_cpu_tensor()[:num_reqs_padded]
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:

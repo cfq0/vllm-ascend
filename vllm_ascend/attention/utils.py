@@ -155,6 +155,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU tensor of sequence lengths for host-side operations.
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
+    # CPU mirror of block_table_tensor. This is maintained by BlockTable and
+    # lets metadata builders inspect block placement without NPU-to-CPU sync.
+    block_table_cpu: torch.Tensor = None
 
     # CPU tensor of already computed tokens count per request.
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
@@ -207,6 +210,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # there will be error about shape mismatch during reshape and cache.
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
+            block_table_cpu=self.block_table_cpu,
             slot_mapping=self.slot_mapping,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],

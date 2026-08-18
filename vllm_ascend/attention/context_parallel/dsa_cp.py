@@ -27,17 +27,30 @@ from vllm_ascend.utils import (
     olora_tp_enable,
 )
 
-# Prefill block-copy plan. token_starts / num_blocks / n_tokens come from CPU qsl
-# (no D2H). first_blocks stays on the block_table device.
-@dataclass
+@dataclass(frozen=True)
+class PrefillCopyRun:
+    """One prefill KV write, fully resolved in the metadata builder."""
+
+    token_start: int
+    n_tokens: int
+    first_block: int
+    n_blocks: int
+
+
+@dataclass(frozen=True)
 class PrefillBlockCopyPlan:
-    token_starts: torch.Tensor
-    num_blocks: torch.Tensor
-    first_blocks: torch.Tensor
-    n_tokens: torch.Tensor
+    """Builder-time KV write plan for SWA / C4 MLA / indexer caches.
+
+    All indices are plain Python ints so ``dsa_forward`` can execute NPU copies
+    without ``aten::item`` / device-scalar indexing.
+    """
+
+    decode_end: int
+    prefill_runs: tuple[PrefillCopyRun, ...]
+    block_size: int
 
     def __bool__(self) -> bool:
-        return int(self.token_starts.numel()) > 0
+        return bool(self.prefill_runs)
 
 
 # Real SWA / C4 MLA(+indexer) use block_size=128; state caches use 8/32 and must be skipped.
@@ -72,7 +85,7 @@ def _build_compressed_query_start_loc(
 
 
 def plan_kv_block_writes(
-    block_table: torch.Tensor,
+    block_table_cpu: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_reqs: int,
     num_decodes: int,
@@ -81,37 +94,55 @@ def plan_kv_block_writes(
 ) -> tuple[PrefillBlockCopyPlan | None, torch.Tensor]:
     """Plan SWA/C4 prefill copies in whole-block units.
 
-    ``query_start_loc`` must already be on CPU (builder passes ``query_start_loc_cpu``).
-    ``first_blocks`` is a view of ``block_table[:, 0]`` and is not copied to host.
+    Resolves CPU ints here so ``dsa_forward`` only issues NPU ``copy_``.
     """
     if device is None:
-        device = block_table.device if block_table is not None else torch.device("cpu")
+        device = torch.device("cpu")
     empty_scatter = torch.empty(0, dtype=torch.int32, device=device)
 
-    def _empty_plan() -> PrefillBlockCopyPlan:
-        return PrefillBlockCopyPlan(
-            token_starts=torch.empty(0, dtype=torch.long),
-            num_blocks=torch.empty(0, dtype=torch.long),
-            first_blocks=torch.empty(0, dtype=torch.int32, device=device),
-            n_tokens=torch.empty(0, dtype=torch.long),
-        )
-
-    if block_table is None or num_reqs <= 0:
-        return _empty_plan(), empty_scatter
     if block_size <= 0:
         block_size = SWA_KV_BLOCK_SIZE
+    if block_table_cpu is None or num_reqs <= 0:
+        return PrefillBlockCopyPlan(decode_end=0, prefill_runs=(), block_size=block_size), empty_scatter
+    if block_table_cpu.device.type != "cpu":
+        raise ValueError("plan_kv_block_writes requires the CPU block-table mirror")
 
     n_decodes = min(num_decodes, num_reqs)
-    if n_decodes >= num_reqs:
-        return _empty_plan(), empty_scatter
-
     qsl = query_start_loc[: num_reqs + 1]
-    n_tok = qsl[1:] - qsl[:-1]
-    prefill_n = n_tok[n_decodes:num_reqs]
-    num_blocks = (prefill_n + block_size - 1) // block_size
-    token_starts = qsl[n_decodes:num_reqs]
-    first_blocks = block_table[n_decodes:num_reqs, 0]
-    return PrefillBlockCopyPlan(token_starts, num_blocks, first_blocks, prefill_n), empty_scatter
+    if qsl.device.type != "cpu":
+        raise ValueError("plan_kv_block_writes requires CPU query_start_loc")
+
+    qsl_values = qsl.tolist()
+    decode_end = qsl_values[n_decodes]
+    prefill_runs: list[PrefillCopyRun] = []
+    for req_idx in range(n_decodes, num_reqs):
+        token_start = qsl_values[req_idx]
+        n_tokens = qsl_values[req_idx + 1] - token_start
+        if n_tokens <= 0:
+            continue
+        n_blocks = (n_tokens + block_size - 1) // block_size
+        block_ids = block_table_cpu[req_idx, :n_blocks].tolist()
+        first_block = block_ids[0]
+        if block_ids != list(range(first_block, first_block + n_blocks)):
+            # A single copy_ is only correct for contiguous physical blocks.
+            # Let forward use one scatter for the complete batch otherwise.
+            return None, empty_scatter
+        prefill_runs.append(
+            PrefillCopyRun(
+                token_start=token_start,
+                n_tokens=n_tokens,
+                first_block=first_block,
+                n_blocks=n_blocks,
+            )
+        )
+    return (
+        PrefillBlockCopyPlan(
+            decode_end=decode_end,
+            prefill_runs=tuple(prefill_runs),
+            block_size=block_size,
+        ),
+        empty_scatter,
+    )
 
 
 # Backward-compatible aliases.
@@ -193,7 +224,6 @@ class AscendDSAReqMetadata:
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
     # Builder-time KV write plan (see plan_kv_block_writes): SWA + C4 MLA/indexer.
-    # first_blocks stays on device; token_starts come from CPU query_start_loc.
     contiguous_slot_runs: PrefillBlockCopyPlan | None = None
     scatter_token_indices: torch.Tensor | None = None
 
@@ -423,10 +453,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
         plan_c4 = self.compressor_ratio == C4_COMPRESS_RATIO
         plan_swa = self.compressor_ratio <= 1
-        if plan_block_size == SWA_KV_BLOCK_SIZE and (plan_swa or plan_c4):
+        block_table_cpu = common_attn_metadata.block_table_cpu
+        if (
+            block_table_cpu is not None
+            and plan_block_size == SWA_KV_BLOCK_SIZE
+            and (plan_swa or plan_c4)
+        ):
             qsl = common_attn_metadata.query_start_loc_cpu
-            if qsl is None:
-                qsl = common_attn_metadata.query_start_loc
+            assert qsl is not None
             if plan_c4:
                 qsl = _build_compressed_query_start_loc(
                     input_positions_cpu,
@@ -435,7 +469,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     compress_ratio=self.compressor_ratio,
                 )
             contiguous_slot_runs, scatter_token_indices = plan_kv_block_writes(
-                self.block_table,
+                block_table_cpu[:num_reqs],
                 query_start_loc=qsl,
                 num_reqs=num_reqs,
                 num_decodes=self.num_decodes,
@@ -511,14 +545,12 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         contiguous_slot_runs: PrefillBlockCopyPlan | None = None
         scatter_token_indices: torch.Tensor | None = None
         plan_block_size = int(self.block_size) if self.block_size is not None else SWA_KV_BLOCK_SIZE
-        if plan_block_size == SWA_KV_BLOCK_SIZE:
-            qsl = (
-                common_attn_metadata.query_start_loc_cpu
-                if common_attn_metadata.query_start_loc_cpu is not None
-                else common_attn_metadata.query_start_loc
-            )
+        block_table_cpu = common_attn_metadata.block_table_cpu
+        if block_table_cpu is not None and plan_block_size == SWA_KV_BLOCK_SIZE:
+            qsl = common_attn_metadata.query_start_loc_cpu
+            assert qsl is not None
             contiguous_slot_runs, scatter_token_indices = plan_kv_block_writes(
-                self.block_table,
+                block_table_cpu[:num_reqs],
                 query_start_loc=qsl,
                 num_reqs=num_reqs,
                 num_decodes=num_reqs,
@@ -1164,35 +1196,6 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         return output
 
-    def _copy_prefill_blocks(
-        self,
-        kv_cache: torch.Tensor,
-        kv: torch.Tensor,
-        token_start: int,
-        first_block: torch.Tensor,
-        n_tokens: int,
-    ) -> None:
-        """Copy this prefill's tokens into contiguous physical cache blocks.
-
-        ``first_block`` stays on device. Full blocks are written as cache rows
-        ``[first_block, first_block+n_full)``; a leftover tail is written into
-        the next row without padding zeros.
-        """
-        if n_tokens <= 0:
-            return
-        block_size = int(kv_cache.shape[1])
-        tail = kv_cache.shape[2:]
-        src = kv[token_start : token_start + n_tokens]
-        first = first_block.to(device=kv_cache.device, dtype=torch.long)
-        n_full, rem = divmod(n_tokens, block_size)
-        if n_full:
-            # first_block is a device scalar; arange stays on device (no .item()).
-            # Example: first=10, n_full=2 → idx=[10, 11] → kv_cache[10] and [11].
-            idx = torch.arange(n_full, device=kv_cache.device, dtype=torch.long) + first
-            kv_cache[idx] = src[: n_full * block_size].reshape(n_full, block_size, *tail)
-        if rem:
-            kv_cache[first + n_full, :rem] = src[n_full * block_size :].reshape(rem, *tail)
-
     def _write_kv_cache_by_plan(
         self,
         kv_cache: torch.Tensor,
@@ -1201,11 +1204,9 @@ class AscendDSACPImpl(DSAAttentionImpl):
         contiguous_slot_runs: PrefillBlockCopyPlan | None,
         scatter_token_indices: torch.Tensor | None,
     ) -> None:
-        """Write KV cache: SWA/C4 prefill whole-block ``copy_``, then decode scatter.
+        """Write KV cache using builder-resolved indices only.
 
-        Used by SWA and C4 MLA (+ indexer). If no plan was built, fall back to
-        full scatter (legacy path). Decode is the token prefix before the first
-        copy_ run (or the full tensor when there are no runs).
+        Forward path performs NPU ``copy_`` / ``npu_scatter_nd_update_v2`` only.
         """
         if kv is None or kv.numel() == 0:
             return
@@ -1214,29 +1215,22 @@ class AscendDSACPImpl(DSAAttentionImpl):
             torch.ops._C_ascend.npu_scatter_nd_update_v2(kv_cache, slot_mapping, kv)
             return
 
-        if contiguous_slot_runs:
-            token_starts = contiguous_slot_runs.token_starts
-            n_tok = contiguous_slot_runs.n_tokens
-            first_blocks = contiguous_slot_runs.first_blocks
-            n_prefills = int(token_starts.shape[0])
-            for i in range(n_prefills):
-                self._copy_prefill_blocks(
-                    kv_cache,
-                    kv,
-                    int(token_starts[i]),
-                    first_blocks[i],
-                    int(n_tok[i]),
-                )
-            decode_end = int(token_starts[0])
-            if decode_end > 0:
-                torch.ops._C_ascend.npu_scatter_nd_update_v2(
-                    kv_cache,
-                    slot_mapping[:decode_end],
-                    kv[:decode_end],
-                )
+        plan = contiguous_slot_runs
+        if plan is None:
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(kv_cache, slot_mapping, kv)
             return
 
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(kv_cache, slot_mapping, kv)
+        if plan.decode_end > 0:
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(
+                kv_cache,
+                slot_mapping[: plan.decode_end],
+                kv[: plan.decode_end],
+            )
+        kv_flat = kv.reshape(-1, *kv_cache.shape[2:])
+        for run in plan.prefill_runs:
+            kv_cache[run.first_block : run.first_block + run.n_blocks].flatten(0, 1)[: run.n_tokens].copy_(
+                kv_flat[run.token_start : run.token_start + run.n_tokens]
+            )
 
     def _write_swa_kv_cache(
         self,
