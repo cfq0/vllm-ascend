@@ -4,8 +4,10 @@
 from tests.ut.base import TestBase
 from vllm_ascend.core.pd_block_pool import (
     C4_KV_BLOCK_REGION_SIZE,
+    C4_SIZE_CLASS_SLABS,
     PREFILL_SIZE_CLASS_SLABS,
     SWA_KV_BLOCK_REGION_SIZE,
+    SWA_SIZE_CLASS_SLABS,
     PDBlockPool,
     PDBlockPoolConfig,
     _PrefillSizeClassRegion,
@@ -19,10 +21,8 @@ def _assert_contiguous(ids: list[int]) -> None:
 
 
 class TestSizeClassSlabs(TestBase):
-    def test_full_template_is_1536(self):
+    def test_mixed_template_is_1536(self):
         self.assertEqual(size_class_region_blocks(), 1536)
-        self.assertEqual(SWA_KV_BLOCK_REGION_SIZE, 1536)
-        self.assertEqual(C4_KV_BLOCK_REGION_SIZE, 1536)
         slabs = plan_size_class_slabs(1, 1536)
         sizes = [cls for _, _, cls in slabs]
         expected = []
@@ -30,6 +30,18 @@ class TestSizeClassSlabs(TestBase):
             expected.extend([cls] * count)
         self.assertEqual(sizes, expected)
         self.assertEqual(sizes, [64] * 8 + [128] * 4 + [256] * 2)
+
+    def test_swa_region_is_64x16(self):
+        self.assertEqual(SWA_KV_BLOCK_REGION_SIZE, 1024)
+        self.assertEqual(size_class_region_blocks(SWA_SIZE_CLASS_SLABS), 1024)
+        slabs = plan_size_class_slabs(1, 1024, SWA_SIZE_CLASS_SLABS)
+        self.assertEqual([cls for _, _, cls in slabs], [64] * 16)
+
+    def test_c4_region_is_64x32(self):
+        self.assertEqual(C4_KV_BLOCK_REGION_SIZE, 2048)
+        self.assertEqual(size_class_region_blocks(C4_SIZE_CLASS_SLABS), 2048)
+        slabs = plan_size_class_slabs(1, 2048, C4_SIZE_CLASS_SLABS)
+        self.assertEqual([cls for _, _, cls in slabs], [64] * 32)
 
     def test_overflow_slab_when_region_is_short(self):
         # 64*8 + 128*3 = 896, leftover 104 → overflow slab.
@@ -115,14 +127,16 @@ class TestPDBlockPoolSizeClass(TestBase):
             pd_config=cfg,
         )
 
-    def test_swa_and_c4_use_separate_1536_regions(self):
+    def test_swa_and_c4_use_separate_regions(self):
         pool = self._pool()
         ss, se = pool.swa_range
         cs, ce = pool.c4_range
-        self.assertEqual(se - ss, 1536)
-        self.assertEqual(ce - cs, 1536)
+        self.assertEqual(se - ss, 1024)
+        self.assertEqual(ce - cs, 2048)
         self.assertEqual(ss, 1)
         self.assertEqual(cs, se)
+        self.assertEqual([s.class_size for s in pool.swa.slabs], [64] * 16)
+        self.assertEqual([s.class_size for s in pool.c4.slabs], [64] * 32)
 
         pool.set_alloc_is_prefill(True)
         pool.set_alloc_is_swa(True)

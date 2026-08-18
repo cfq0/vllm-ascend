@@ -12,15 +12,18 @@ Layout (null block at 0)::
     [1+SWA+C4, P)        other prefill free-list (C128 + compressor state)
     [P, N)               decode free-list (all groups, including SWA/C4 in decode)
 
-SWA and C4 are carved into fixed **size-class slabs**::
+SWA and C4 are carved into fixed **size-class slabs** (class-64 only)::
 
-    64 x 8 / 128 x 4 / 256 x 2   (= 1536 ids when the region is full)
+    SWA  64 x 16  (= 1024 ids)
+    C4   64 x 32  (= 2048 ids)
 
-Allocation for SWA/C4 picks the smallest free slab whose class is ``>= n``
-and takes ``n`` ids from that slab's start. A slab is occupied as a whole
-(leftover ids stay reserved) until every given-out id is freed; never
-searches inside a slab or stitches across slabs. If every slab of that
-class is busy, the request escalates to the next larger class. Other
+Chunked prefill + SWA sliding window can free the previous chunk's ids, so
+SWA needs fewer concurrent slabs than C4 (full compressed KV until the
+request ends). Allocation picks the smallest free slab whose class is
+``>= n`` and takes ``n`` ids from that slab's start. A slab is occupied as
+a whole (leftover ids stay reserved) until every given-out id is freed;
+never searches inside a slab or stitches across slabs. If every slab of
+that class is busy, the request escalates to the next larger class. Other
 prefill and decode use a free-list; ids need not be contiguous.
 
 Routing:
@@ -49,14 +52,18 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
 
-# Prefill size-class slabs (64×8 + 128×4 + 256×2 → 1536 ids).
-# Token span at SWA/C4 block_size=128: 8k / 16k / 32k.
+# Generic mixed template for the planner / region unit tests (escalation).
+# Token span at block_size=128: 8k / 16k / 32k.
 PREFILL_SIZE_CLASS_SLABS: tuple[tuple[int, int], ...] = (
     (64, 8),
     (128, 4),
     (256, 2),
 )
 PREFILL_SIZE_CLASSES = tuple(cls for cls, _ in PREFILL_SIZE_CLASS_SLABS)
+
+# Production PD regions: class-64 only. One ~8k chunk occupies one slab.
+SWA_SIZE_CLASS_SLABS: tuple[tuple[int, int], ...] = ((64, 16),)
+C4_SIZE_CLASS_SLABS: tuple[tuple[int, int], ...] = ((64, 32),)
 
 
 def size_class_region_blocks(
@@ -66,8 +73,8 @@ def size_class_region_blocks(
 
 
 # SWA / C4 regions are exactly one full size-class template.
-SWA_KV_BLOCK_REGION_SIZE = size_class_region_blocks()
-C4_KV_BLOCK_REGION_SIZE = size_class_region_blocks()
+SWA_KV_BLOCK_REGION_SIZE = size_class_region_blocks(SWA_SIZE_CLASS_SLABS)
+C4_KV_BLOCK_REGION_SIZE = size_class_region_blocks(C4_SIZE_CLASS_SLABS)
 # Decode free-list size; leftover after SWA+C4+decode goes to other-prefill.
 DECODE_KV_BLOCK_REGION_SIZE = 64
 # Absolute floor for "other prefill" (C128 / compressor state / ...).
@@ -372,8 +379,12 @@ class PDBlockPool(BlockPool):
             self.free_block_queue.popleft_n(n_free)
         assert self.free_block_queue.num_free_blocks == 0
 
-        self.swa = _PrefillSizeClassRegion(swa_start, swa_end, name="swa")
-        self.c4 = _PrefillSizeClassRegion(swa_end, c4_end, name="c4")
+        self.swa = _PrefillSizeClassRegion(
+            swa_start, swa_end, name="swa", class_slabs=SWA_SIZE_CLASS_SLABS
+        )
+        self.c4 = _PrefillSizeClassRegion(
+            swa_end, c4_end, name="c4", class_slabs=C4_SIZE_CLASS_SLABS
+        )
         self.prefill = _FreeListRegion(c4_end, prefill_end, name="prefill")
         self.decode = _FreeListRegion(prefill_end, decode_end, name="decode")
         # None = unset (treat as total free for get_num_free_blocks).
