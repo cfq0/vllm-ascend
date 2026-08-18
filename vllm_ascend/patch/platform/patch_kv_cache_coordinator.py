@@ -57,9 +57,10 @@ def _layer_kv_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
 def _is_swa_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
     """True for real SWA KV (SlidingWindowMLASpec, block_size=128).
 
-    DSv4 packs SWA layers into one ``UniformTypeKVCacheSpecs`` group.
-    Compressor state caches also use SlidingWindowMLASpec but with
-    block_size 8/32 and must keep using the non-SWA PD regions.
+    DSv4 groups C4/C128 first, then splits the SWA UniformType bucket into
+    several managers (typically i=2 and i=3) to align layer-tuples. Those
+    managers share one PD SWA id region. Compressor state caches also use
+    SlidingWindowMLASpec but with block_size 8/32 and must not match.
     """
     specs = _layer_kv_specs(manager.kv_cache_spec)
     return bool(specs) and all(
@@ -73,6 +74,27 @@ def _is_c4_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
     return bool(specs) and all(
         isinstance(s, MLAAttentionSpec) and int(getattr(s, "compress_ratio", 1)) == _C4_COMPRESS_RATIO for s in specs
     )
+
+
+def _share_req_blocks(
+    dst: SingleTypeKVCacheManager,
+    src: SingleTypeKVCacheManager,
+    request_id: str,
+) -> list[KVCacheBlock]:
+    """Reuse ``src``'s physical blocks on ``dst`` for this request.
+
+    Extra ``ref_cnt`` so two manager frees return the ids to the pool once.
+    """
+    src_blocks = src.req_to_blocks[request_id]
+    dst_blocks = dst.req_to_blocks[request_id]
+    new = src_blocks[len(dst_blocks) :]
+    for block in new:
+        block.ref_cnt += 1
+    dst_blocks.extend(new)
+    num_cached = getattr(src, "num_cached_block", None)
+    if num_cached is not None and request_id in num_cached:
+        dst.num_cached_block[request_id] = num_cached[request_id]
+    return new
 
 
 def _dump_single_type_kv_caches(
@@ -278,7 +300,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         num_tokens_main_model: int | None = None,
         apply_admission_cap: bool = False,
     ) -> int:
-        """Prefill: other-prefill need. Decode: total vs decode region."""
+        """Prefill: other-prefill need. Decode: total vs decode region.
+
+        SWA managers from the DSv4 layer-tuple split share one PD SWA region,
+        so SWA need is ``max`` across those managers, not a sum.
+        """
         if num_tokens_main_model is None:
             num_tokens_main_model = num_tokens
         swa_need = 0
@@ -308,10 +334,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     apply_admission_cap,
                 )
             if _is_swa_kv_manager(manager):
-                swa_need += n
+                # Manager 2/3 (etc.) are SWA splits of the same 128 bucket.
+                swa_need = max(swa_need, n)
                 print(
-                    f"[PDAdmit] SWA need req={request_id} n={n} swa_need={swa_need} "
-                    f"num_tokens={num_tokens} is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
+                    f"[PDAdmit] SWA need req={request_id} manager={i} n={n} "
+                    f"swa_need={swa_need} num_tokens={num_tokens} "
+                    f"is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
                     flush=True,
                 )
             elif _is_c4_kv_manager(manager):
@@ -359,11 +387,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         # Prefill-only size-class regions; decode ignores SWA/C4 flags and uses decode region.
         use_prefill_regions = pool._alloc_is_prefill is True
+        swa_src: SingleTypeKVCacheManager | None = None
         try:
             managers = self.single_type_managers
             # Prefer upstream two-phase API when present.
             if hasattr(managers[0], "add_local_computed_blocks"):
                 for i, manager in enumerate(managers):
+                    if _is_swa_kv_manager(manager) and swa_src is not None:
+                        _share_req_blocks(manager, swa_src, request_id)
+                        continue
                     _set_pd_alloc_region(pool, manager, use_prefill_regions)
                     manager.add_local_computed_blocks(
                         request_id,
@@ -371,8 +403,13 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         num_local_computed_tokens,
                         num_external_computed_tokens,
                     )
+                    if _is_swa_kv_manager(manager):
+                        swa_src = manager
                 if num_external_computed_tokens > 0:
                     for manager in managers:
+                        if _is_swa_kv_manager(manager) and swa_src is not None and manager is not swa_src:
+                            _share_req_blocks(manager, swa_src, request_id)
+                            continue
                         _set_pd_alloc_region(pool, manager, use_prefill_regions)
                         manager.allocate_external_computed_blocks(
                             request_id,
@@ -381,6 +418,9 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         )
             else:
                 for i, manager in enumerate(managers):
+                    if _is_swa_kv_manager(manager) and swa_src is not None:
+                        _share_req_blocks(manager, swa_src, request_id)
+                        continue
                     _set_pd_alloc_region(pool, manager, use_prefill_regions)
                     manager.allocate_new_computed_blocks(
                         request_id,
@@ -388,6 +428,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         num_local_computed_tokens,
                         num_external_computed_tokens,
                     )
+                    if _is_swa_kv_manager(manager):
+                        swa_src = manager
         finally:
             pool.clear_alloc_is_swa()
             pool.clear_alloc_is_c4()
@@ -411,8 +453,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # Prefill-only size-class regions; decode ignores SWA/C4 flags and uses decode region.
         use_prefill_regions = pool._alloc_is_prefill is True
         results: list[list[KVCacheBlock]] = []
+        swa_src: SingleTypeKVCacheManager | None = None
         try:
             for manager in self.single_type_managers:
+                if _is_swa_kv_manager(manager) and swa_src is not None:
+                    results.append(_share_req_blocks(manager, swa_src, request_id))
+                    continue
                 _set_pd_alloc_region(pool, manager, use_prefill_regions)
                 tokens = (
                     num_encoder_tokens
@@ -420,6 +466,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     else num_tokens
                 )
                 results.append(manager.allocate_new_blocks(request_id, tokens, num_tokens_main_model))
+                if _is_swa_kv_manager(manager):
+                    swa_src = manager
         finally:
             pool.clear_alloc_is_swa()
             pool.clear_alloc_is_c4()
