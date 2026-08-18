@@ -75,6 +75,32 @@ def _is_c4_kv_manager(manager: SingleTypeKVCacheManager) -> bool:
     )
 
 
+def _dump_single_type_kv_caches(
+    kv_cache_groups,
+    managers: tuple[SingleTypeKVCacheManager, ...],
+) -> None:
+    """Print every KV cache group / SingleType manager at coordinator init."""
+    print(f"[PDKV] n_groups={len(kv_cache_groups)} n_managers={len(managers)}", flush=True)
+    for i, (group, manager) in enumerate(zip(kv_cache_groups, managers)):
+        spec = manager.kv_cache_spec
+        inners = _layer_kv_specs(spec)
+        inner0 = inners[0] if inners else None
+        names = list(group.layer_names)
+        print(
+            f"[PDKV] i={i} manager={type(manager).__name__} "
+            f"spec={type(spec).__name__} n_layers={len(names)} "
+            f"spec_bs={getattr(spec, 'block_size', None)} "
+            f"inner={type(inner0).__name__ if inner0 else None} "
+            f"inner_bs={getattr(inner0, 'block_size', None)} "
+            f"compress_ratio={getattr(inner0, 'compress_ratio', None)} "
+            f"sliding_window={getattr(inner0, 'sliding_window', None)} "
+            f"is_swa={_is_swa_kv_manager(manager)} is_c4={_is_c4_kv_manager(manager)} "
+            f"eagle={getattr(group, 'is_eagle_group', None)} "
+            f"layers={names[:4]}{'...' if len(names) > 4 else ''}",
+            flush=True,
+        )
+
+
 def _set_pd_alloc_region(pool: PDBlockPool, manager: SingleTypeKVCacheManager, use_prefill_regions: bool) -> None:
     """Route one manager alloc to SWA / C4 / other-prefill region (prefill only)."""
     if not use_prefill_regions:
@@ -191,6 +217,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        _dump_single_type_kv_caches(self.kv_cache_config.kv_cache_groups, self.single_type_managers)
 
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
