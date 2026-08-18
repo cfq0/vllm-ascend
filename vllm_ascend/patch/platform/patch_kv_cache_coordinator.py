@@ -97,32 +97,6 @@ def _share_req_blocks(
     return new
 
 
-def _dump_single_type_kv_caches(
-    kv_cache_groups,
-    managers: tuple[SingleTypeKVCacheManager, ...],
-) -> None:
-    """Print every KV cache group / SingleType manager at coordinator init."""
-    print(f"[PDKV] n_groups={len(kv_cache_groups)} n_managers={len(managers)}", flush=True)
-    for i, (group, manager) in enumerate(zip(kv_cache_groups, managers)):
-        spec = manager.kv_cache_spec
-        inners = _layer_kv_specs(spec)
-        inner0 = inners[0] if inners else None
-        names = list(group.layer_names)
-        print(
-            f"[PDKV] i={i} manager={type(manager).__name__} "
-            f"spec={type(spec).__name__} n_layers={len(names)} "
-            f"spec_bs={getattr(spec, 'block_size', None)} "
-            f"inner={type(inner0).__name__ if inner0 else None} "
-            f"inner_bs={getattr(inner0, 'block_size', None)} "
-            f"compress_ratio={getattr(inner0, 'compress_ratio', None)} "
-            f"sliding_window={getattr(inner0, 'sliding_window', None)} "
-            f"is_swa={_is_swa_kv_manager(manager)} is_c4={_is_c4_kv_manager(manager)} "
-            f"eagle={getattr(group, 'is_eagle_group', None)} "
-            f"layers={names[:4]}{'...' if len(names) > 4 else ''}",
-            flush=True,
-        )
-
-
 def _set_pd_alloc_region(pool: PDBlockPool, manager: SingleTypeKVCacheManager, use_prefill_regions: bool) -> None:
     """Route one manager alloc to SWA / C4 / other-prefill region (prefill only)."""
     if not use_prefill_regions:
@@ -239,7 +213,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
-        _dump_single_type_kv_caches(self.kv_cache_config.kv_cache_groups, self.single_type_managers)
 
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -336,23 +309,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             if _is_swa_kv_manager(manager):
                 # Manager 2/3 (etc.) are SWA splits of the same 128 bucket.
                 swa_need = max(swa_need, n)
-                print(
-                    f"[PDAdmit] SWA need req={request_id} manager={i} n={n} "
-                    f"swa_need={swa_need} num_tokens={num_tokens} "
-                    f"is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
-                    flush=True,
-                )
             elif _is_c4_kv_manager(manager):
                 c4_need += n
-                c4_region = getattr(self.block_pool, "c4", None)
-                print(
-                    f"[PDAdmit] C4 need req={request_id} manager={i} n={n} "
-                    f"c4_need={c4_need} "
-                    f"c4_free={None if c4_region is None else c4_region.num_free} "
-                    f"num_tokens={num_tokens} "
-                    f"is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
-                    flush=True,
-                )
             else:
                 other_need += n
 
@@ -361,15 +319,6 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             if pool._alloc_is_prefill is False:
                 return swa_need + c4_need + other_need
             if swa_need > pool.swa.num_free or c4_need > pool.c4.num_free:
-                print(
-                    f"[PDAdmit] reject req={request_id} "
-                    f"swa_need={swa_need} swa_free={pool.swa.num_free} "
-                    f"c4_need={c4_need} c4_free={pool.c4.num_free} "
-                    f"{pool.c4.debug_status()} busy={pool.c4.busy_detail()} "
-                    f"other_need={other_need} other_free={pool.prefill.num_free} "
-                    f"return={pool.prefill.num_free + 1}",
-                    flush=True,
-                )
                 # Fail ``need <= get_num_free_blocks()``; probe returns other-prefill free.
                 return pool.prefill.num_free + 1
             return other_need
