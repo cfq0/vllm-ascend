@@ -344,6 +344,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 )
             elif _is_c4_kv_manager(manager):
                 c4_need += n
+                c4_region = getattr(self.block_pool, "c4", None)
+                print(
+                    f"[PDAdmit] C4 need req={request_id} manager={i} n={n} "
+                    f"c4_need={c4_need} "
+                    f"c4_free={None if c4_region is None else c4_region.num_free} "
+                    f"num_tokens={num_tokens} "
+                    f"is_prefill={getattr(self.block_pool, '_alloc_is_prefill', None)}",
+                    flush=True,
+                )
             else:
                 other_need += n
 
@@ -356,6 +365,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     f"[PDAdmit] reject req={request_id} "
                     f"swa_need={swa_need} swa_free={pool.swa.num_free} "
                     f"c4_need={c4_need} c4_free={pool.c4.num_free} "
+                    f"{pool.c4.debug_status()} busy={pool.c4.busy_detail()} "
                     f"other_need={other_need} other_free={pool.prefill.num_free} "
                     f"return={pool.prefill.num_free + 1}",
                     flush=True,

@@ -266,6 +266,22 @@ class _PrefillSizeClassRegion:
     def num_free(self) -> int:
         return sum(slab.num_free for slab in self.slabs)
 
+    def debug_status(self) -> str:
+        busy = sum(1 for s in self.slabs if s._busy)
+        live = sum(len(s._live) for s in self.slabs)
+        return (
+            f"busy_slabs={busy}/{len(self.slabs)} live_ids={live} "
+            f"num_free={self.num_free}/{self.capacity}"
+        )
+
+    def busy_detail(self) -> str:
+        parts = [
+            f"{i}:[{s.start},{s.end})live={len(s._live)}"
+            for i, s in enumerate(self.slabs)
+            if s._busy
+        ]
+        return ",".join(parts) if parts else "-"
+
     def allocate_contiguous(self, n: int) -> list[int]:
         """Allocate ``n`` contiguous ids from one free size-class slab.
 
@@ -283,6 +299,13 @@ class _PrefillSizeClassRegion:
             for slab in self._slabs_by_class[cls]:
                 got = slab.try_allocate(n)
                 if got is not None:
+                    if self.name == "c4":
+                        print(
+                            f"[PDC4] alloc n={n} ids=[{got[0]},{got[-1] + 1}) "
+                            f"slab=[{slab.start},{slab.end}) cls={slab.class_size} "
+                            f"{self.debug_status()}",
+                            flush=True,
+                        )
                     return got
 
         raise ValueError(
@@ -291,8 +314,21 @@ class _PrefillSizeClassRegion:
         )
 
     def free(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        busy_before = [s._busy for s in self.slabs] if self.name == "c4" else None
         for bid in block_ids:
             self._slab_for_id(bid).free([bid])
+        if self.name == "c4":
+            unbusy = sum(
+                1 for was, s in zip(busy_before, self.slabs) if was and not s._busy
+            )
+            print(
+                f"[PDC4] free n={len(block_ids)} "
+                f"ids=[{min(block_ids)},{max(block_ids) + 1}) "
+                f"unbusy_slabs={unbusy} {self.debug_status()}",
+                flush=True,
+            )
 
     def _slab_for_id(self, block_id: int) -> _SizeClassSlab:
         for slab in self.slabs:
@@ -520,10 +556,13 @@ class PDBlockPool(BlockPool):
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         blocks_list = list(ordered_blocks)
         to_free: list[KVCacheBlock] = []
+        held_c4 = 0
         for block in blocks_list:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 to_free.append(block)
+            elif self.c4.start <= block.block_id < self.c4.end:
+                held_c4 += 1
 
         swa_ids: list[int] = []
         c4_ids: list[int] = []
@@ -545,6 +584,12 @@ class PDBlockPool(BlockPool):
             self.swa.free(swa_ids)
         if c4_ids:
             self.c4.free(c4_ids)
+        elif held_c4:
+            print(
+                f"[PDC4] free_blocks held_refcnt={held_c4} returned=0 "
+                f"{self.c4.debug_status()}",
+                flush=True,
+            )
         if prefill_ids:
             self.prefill.free(prefill_ids)
         if decode_ids:
